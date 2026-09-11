@@ -2368,6 +2368,8 @@ status_check() {
     for f in "$rundir"/pending_*; do
         [ -f "$f" ] || continue
         u="${f##*/pending_}"
+        # Marker left behind by a deleted user: ignore (the monitor prunes it on its next poll)
+        [ -d "/home/$u/uploads" ] || continue
         p_since=$(cat "$f" 2>/dev/null || echo "$now")
         p_age=$(( now - p_since ))
         pending=$((pending + 1))

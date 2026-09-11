@@ -990,6 +990,13 @@ while true; do
         fi
     done
 
+    # Drop markers of users that no longer exist (deleted while changes were pending)
+    for f in "$RUNDIR"/pending_*; do
+        [ -e "$f" ] || continue
+        user="${f##*/pending_}"
+        [ -n "${cur_gen[$user]+set}" ] || rm -f "$f"
+    done
+
     sleep "$POLL_INTERVAL"
 done
 EOF
