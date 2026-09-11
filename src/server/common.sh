@@ -139,3 +139,122 @@ is_backup_user() {
     local username="$1"
     groups "$username" 2>/dev/null | grep -q "backupusers"
 }
+
+# ---------------------------------------------------------------------------
+# Btrfs quota-accounting usage cache
+# ---------------------------------------------------------------------------
+# Builds per-user usage figures from ONE `btrfs qgroup show --raw` call instead
+# of walking the filesystem. Cost is O(subvolumes), independent of file count,
+# so it stays fast even for users with millions of files.
+#
+# Semantics (simple-quota / squota mode):
+#   Referenced = bytes of extents referenced by the subvolume (~logical size)
+#   Exclusive  = bytes attributed to this subvolume (each extent is attributed
+#                to exactly one subvolume, so summing Exclusive over a user's
+#                uploads + snapshots gives that user's physical footprint)
+#
+# Populates global associative arrays keyed by username (values in bytes):
+#   QG_UPLOADS_RFER, QG_UPLOADS_EXCL   - the uploads subvolume
+#   QG_SNAP_RFER,    QG_SNAP_EXCL      - summed over all snapshots
+#   QG_SNAP_COUNT                      - number of snapshot subvolumes seen
+# and keyed by "username/snapshot-name":
+#   QG_SNAP_RFER_BY_NAME, QG_SNAP_EXCL_BY_NAME
+# Sets QGROUP_INCONSISTENT=true when btrfs warns that accounting is stale.
+#
+# Usage: build_qgroup_usage_cache [mountpoint]   (default /home)
+# Returns 1 if quotas are not enabled or the output cannot be parsed.
+build_qgroup_usage_cache() {
+    local mount="${1:-/home}"
+    declare -gA QG_UPLOADS_RFER=() QG_UPLOADS_EXCL=() QG_SNAP_RFER=() QG_SNAP_EXCL=() QG_SNAP_COUNT=()
+    declare -gA QG_SNAP_RFER_BY_NAME=() QG_SNAP_EXCL_BY_NAME=()
+    declare -g QGROUP_INCONSISTENT=false
+    declare -g QGROUP_CACHE_READY=false
+
+    local errfile
+    errfile=$(mktemp) || return 1
+    local output
+    if ! output=$(btrfs qgroup show --raw "$mount" 2>"$errfile"); then
+        rm -f "$errfile"
+        return 1
+    fi
+    if grep -qi "inconsistent" "$errfile" 2>/dev/null; then
+        QGROUP_INCONSISTENT=true
+    fi
+    rm -f "$errfile"
+
+    # Only level-0 qgroups (0/<subvol id>) map to real subvolumes. Skip the
+    # header, <toplevel>, <stale> (pending deletions) and level-1 groups.
+    # Paths are printed relative to the mounted subvolume, so match the
+    # trailing "<user>/uploads" or "<user>/versions/<snapshot>" segments
+    # regardless of any prefix (e.g. "@home/").
+    local kind user snap rfer excl
+    while IFS='|' read -r kind user snap rfer excl; do
+        case "$kind" in
+            uploads)
+                QG_UPLOADS_RFER["$user"]=$rfer
+                QG_UPLOADS_EXCL["$user"]=$excl
+                ;;
+            snapshot)
+                QG_SNAP_RFER["$user"]=$(( ${QG_SNAP_RFER["$user"]:-0} + rfer ))
+                QG_SNAP_EXCL["$user"]=$(( ${QG_SNAP_EXCL["$user"]:-0} + excl ))
+                QG_SNAP_COUNT["$user"]=$(( ${QG_SNAP_COUNT["$user"]:-0} + 1 ))
+                QG_SNAP_RFER_BY_NAME["$user/$snap"]=$rfer
+                QG_SNAP_EXCL_BY_NAME["$user/$snap"]=$excl
+                ;;
+        esac
+    done < <(echo "$output" | awk '
+        $1 ~ /^0\// && NF >= 4 && $4 !~ /^</ {
+            n = split($4, seg, "/")
+            if (n >= 2 && seg[n] == "uploads") {
+                print "uploads|" seg[n-1] "||" $2 "|" $3
+            } else if (n >= 3 && seg[n-1] == "versions") {
+                print "snapshot|" seg[n-2] "|" seg[n] "|" $2 "|" $3
+            }
+        }')
+
+    QGROUP_CACHE_READY=true
+    return 0
+}
+
+# Convert a byte count to MB with two decimals (no bc dependency).
+# Usage: bytes_to_mb <bytes>
+bytes_to_mb() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1048576 }'
+}
+
+# Enumerate a user's snapshot directories without spawning a process per
+# snapshot. Snapshot names are YYYY-MM-DD_HH-MM-SS, so lexicographic order is
+# chronological order and no date parsing is needed to find oldest/newest.
+# Prints: "<count>|<oldest name>|<newest name>" (names empty when count is 0)
+# Usage: get_snapshot_range <versions_dir>
+get_snapshot_range() {
+    local versions_dir="$1"
+    local count=0 oldest="" newest="" d name
+    if [ -d "$versions_dir" ]; then
+        for d in "$versions_dir"/*/; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] || continue
+            count=$((count + 1))
+            [ -z "$oldest" ] && oldest="$name"
+            newest="$name"
+        done
+    fi
+    echo "${count}|${oldest}|${newest}"
+}
+
+# Convert a snapshot name (YYYY-MM-DD_HH-MM-SS) to "epoch|YYYY-MM-DD HH:MM:SS".
+# Usage: snapshot_name_to_epoch <name>
+snapshot_name_to_epoch() {
+    local name="$1"
+    if [[ "$name" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})-([0-9]{2})-([0-9]{2})$ ]]; then
+        local formatted="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}:${BASH_REMATCH[4]}"
+        local epoch
+        epoch=$(date -d "$formatted" +%s 2>/dev/null || echo 0)
+        echo "${epoch}|${formatted}"
+    else
+        echo "0|Unknown"
+    fi
+}

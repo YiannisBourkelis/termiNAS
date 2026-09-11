@@ -5,6 +5,15 @@ All notable changes to termiNAS will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`manage_users.sh list-fast` and `info-fast`** (experimental): compute all sizes from a single `btrfs qgroup show` call instead of walking every file, so they complete in well under a second regardless of file count. Provided alongside `list`/`info` for side-by-side comparison; `info-fast` includes a per-snapshot Referenced/Exclusive breakdown.
+- Shared helpers in `common.sh`: `build_qgroup_usage_cache` (one-pass qgroup parser keyed by user), `bytes_to_mb`, `get_snapshot_range`, `snapshot_name_to_epoch`.
+
+### Notes
+- The alpha.4 changelog entry stating that `list` was switched to a single qgroup fetch was inaccurate: `list` still runs `btrfs filesystem du` per user. The `-fast` variants deliver that change.
+
 ## [1.0.0-alpha.4] - 2026-03-02
 
 ### Changed

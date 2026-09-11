@@ -48,7 +48,9 @@ Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
     list                    List all backup users with disk usage and connection status
+    list-fast               Same as list, sizes from Btrfs quota accounting (no file walk; experimental)
     info <username>         Show detailed information including connection activity
+    info-fast <username>    Same as info, sizes from Btrfs quota accounting with per-snapshot breakdown (experimental)
     history <username>      Show snapshot history for a user
     search <pattern>        Search for files in latest snapshots
     inactive [days]         List users with no recent uploads (default: 30 days)
@@ -2143,6 +2145,441 @@ info_user() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Fast variants (list-fast / info-fast)
+# ---------------------------------------------------------------------------
+# These compute sizes from Btrfs quota accounting (one `btrfs qgroup show`
+# call, see build_qgroup_usage_cache in common.sh) instead of walking every
+# file. They exist alongside `list`/`info` so results and timings can be
+# compared on real data before the slow implementations are replaced.
+#
+# Size semantics differ slightly from the filesystem-walk versions:
+#   Size(MB)  = sum of Exclusive bytes over uploads + all snapshots
+#               (physical footprint as attributed by simple quotas)
+#   Apparent  = sum of Referenced bytes over uploads + all snapshots
+#               (each subvolume counted as an independent copy)
+# Extents written before quotas were enabled are not attributed to any
+# qgroup and therefore do not appear in these figures.
+
+# Determine the status text/color for a user from snapshot and connection times.
+# Args: $1 = last snapshot date ("Never" or formatted), $2 = last snapshot epoch,
+#       $3 = last connection epoch, $4 = current epoch
+# Prints: "<status>|<ansi color or empty>"
+compute_user_status() {
+    local last_date="$1" last_epoch="$2" conn_epoch="$3" now="$4"
+    local status="OK" status_color=""
+
+    if [ "$last_date" = "Never" ] && [ "${conn_epoch:-0}" -eq 0 ]; then
+        status="⚠ NEVER USED"
+        status_color="\033[1;33m"
+    elif [ "$last_date" = "Never" ]; then
+        local conn_days=$(( (now - conn_epoch) / 86400 ))
+        status="⚠ No snapshot (conn: ${conn_days}d)"
+        status_color="\033[1;33m"
+    elif [ "${last_epoch:-0}" -gt 0 ]; then
+        local backup_days=$(( (now - last_epoch) / 86400 ))
+        if [ "${conn_epoch:-0}" -gt "$last_epoch" ]; then
+            if [ "$backup_days" -gt 15 ]; then
+                status="✓ No changes (${backup_days}d)"
+            else
+                status="✓ OK (${backup_days}d)"
+            fi
+            status_color="\033[0;32m"
+        else
+            if [ "$backup_days" -gt 15 ]; then
+                status="⚠ ${backup_days}d ago"
+                status_color="\033[1;33m"
+            else
+                status="✓ OK (${backup_days}d)"
+                status_color="\033[0;32m"
+            fi
+        fi
+    fi
+
+    echo "${status}|${status_color}"
+}
+
+# Determine the protocol column value for a user (SFTP, SMB+SFTP, SMB*TM+SFTP, ...)
+get_user_protocol() {
+    local user="$1"
+    local protocol="SFTP"
+    if has_samba_enabled "$user"; then
+        local has_versions=no has_tm=no
+        has_samba_versions_enabled "$user" 2>/dev/null && has_versions=yes
+        has_timemachine_enabled "$user" 2>/dev/null && has_tm=yes
+        if [ "$has_versions" = yes ] && [ "$has_tm" = yes ]; then
+            protocol="SMB*TM+SFTP"
+        elif [ "$has_versions" = yes ]; then
+            protocol="SMB*+SFTP"
+        elif [ "$has_tm" = yes ]; then
+            protocol="SMBTM+SFTP"
+        else
+            protocol="SMB+SFTP"
+        fi
+    fi
+    echo "$protocol"
+}
+
+# Print the "Connection Activity" block for a user (caches must be built first)
+print_connection_activity() {
+    local username="$1"
+    local now
+    now=$(date +%s)
+
+    local conn_info
+    conn_info=$(get_last_connection "$username")
+    local last_conn="${conn_info%%|*}"
+    local conn_epoch="${conn_info##*|}"
+
+    echo "Connection Activity:"
+    if [ "$last_conn" != "Never" ] && [ "${conn_epoch:-0}" -gt 0 ]; then
+        local days_ago=$(( (now - conn_epoch) / 86400 ))
+        local hours_ago=$(( (now - conn_epoch) / 3600 ))
+        echo "  Last SFTP:       $last_conn"
+        if [ "$hours_ago" -lt 24 ]; then
+            echo "                   ${hours_ago} hours ago"
+        else
+            echo "                   ${days_ago} days ago"
+        fi
+    else
+        echo "  Last SFTP:       Never"
+    fi
+
+    if has_samba_enabled "$username"; then
+        local samba_info="${SAMBA_CONNECTION_CACHE[$username]}"
+        local samba_conn="${samba_info%%|*}"
+        local samba_epoch="${samba_info##*|}"
+        if [ -n "$samba_info" ] && [ "${samba_epoch:-0}" -gt 0 ]; then
+            local days_ago=$(( (now - samba_epoch) / 86400 ))
+            local hours_ago=$(( (now - samba_epoch) / 3600 ))
+            echo "  Last SMB:        $samba_conn"
+            if [ "$hours_ago" -lt 24 ]; then
+                echo "                   ${hours_ago} hours ago"
+            else
+                echo "                   ${days_ago} days ago"
+            fi
+        else
+            echo "  Last SMB:        Never"
+        fi
+    fi
+}
+
+# Print the retention policy block for a user
+print_retention_policy() {
+    local username="$1"
+    [ -f /etc/terminas-retention.conf ] || return 0
+    source /etc/terminas-retention.conf
+
+    # Replace dashes with underscores for valid bash variable names
+    local safe_username="${username//-/_}"
+    local user_daily_var="${safe_username}_KEEP_DAILY"
+    local user_weekly_var="${safe_username}_KEEP_WEEKLY"
+    local user_monthly_var="${safe_username}_KEEP_MONTHLY"
+    local user_retention_var="${safe_username}_RETENTION_DAYS"
+    local user_advanced_var="${safe_username}_ENABLE_ADVANCED_RETENTION"
+
+    if [ -n "${!user_daily_var}" ] || [ -n "${!user_weekly_var}" ] || [ -n "${!user_monthly_var}" ] || \
+       [ -n "${!user_retention_var}" ] || [ -n "${!user_advanced_var}" ]; then
+        echo "Retention Policy: Custom"
+        [ -n "${!user_advanced_var}" ] && echo "  Advanced: ${!user_advanced_var}"
+        [ -n "${!user_daily_var}" ] && echo "  Keep daily: ${!user_daily_var}"
+        [ -n "${!user_weekly_var}" ] && echo "  Keep weekly: ${!user_weekly_var}"
+        [ -n "${!user_monthly_var}" ] && echo "  Keep monthly: ${!user_monthly_var}"
+        [ -n "${!user_retention_var}" ] && echo "  Retention days: ${!user_retention_var}"
+    else
+        echo "Retention Policy: Default (from /etc/terminas-retention.conf)"
+    fi
+    return 0
+}
+
+# Print a notice when Btrfs reports its quota accounting as inconsistent
+print_qgroup_inconsistency_note() {
+    if [ "${QGROUP_INCONSISTENT:-false}" = true ]; then
+        echo ""
+        echo -e "\033[1;33m⚠ Btrfs reports quota accounting as inconsistent; figures may be stale.\033[0m"
+        echo "  Refresh (this drops all qgroup limits - reapply quotas with set-quota afterwards):"
+        echo "    btrfs quota disable /home && btrfs quota enable --simple /home"
+    fi
+    return 0
+}
+
+# Fast list: same columns as `list`, sizes from quota accounting
+list_users_fast() {
+    local users
+    users=$(get_backup_users)
+    if [ -z "$users" ]; then
+        echo "No backup users found."
+        return
+    fi
+
+    if ! build_qgroup_usage_cache /home; then
+        echo "Error: Btrfs quotas are not enabled on /home (required for list-fast)." >&2
+        echo "Enable with: btrfs quota enable --simple /home   (or re-run setup.sh)" >&2
+        return 1
+    fi
+
+    local any_samba=false
+    local user
+    while IFS= read -r user; do
+        if [ -n "$user" ] && has_samba_enabled "$user"; then
+            any_samba=true
+            break
+        fi
+    done <<< "$users"
+
+    echo "Backup Users (fast):"
+    if [ "$any_samba" = true ]; then
+        echo "======================================================================================================================================================================================================"
+        printf "%-16s %12s %12s %6s %12s %23s %20s %20s %10s\n" "Username" "Size(MB)" "Apparent" "Snaps" "Protocol" "Last Snapshot" "Last SFTP" "Last SMB" "Status"
+        echo "------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+    else
+        echo "======================================================================================================================================"
+        printf "%-16s %12s %12s %6s %12s %23s %23s %10s\n" "Username" "Size(MB)" "Apparent" "Snaps" "Protocol" "Last Snapshot" "Last SFTP" "Status"
+        echo "--------------------------------------------------------------------------------------------------------------------------------------"
+    fi
+
+    build_connection_cache
+    if [ "$any_samba" = true ]; then
+        build_samba_connection_cache
+    fi
+
+    local total_actual_bytes=0 total_apparent_bytes=0 total_users=0
+    local now
+    now=$(date +%s)
+
+    while IFS= read -r user; do
+        [ -n "$user" ] || continue
+        local home_dir="/home/$user"
+        [ -d "$home_dir" ] || continue
+
+        # Sizes straight from the qgroup cache (no filesystem walk)
+        local actual_bytes=$(( ${QG_UPLOADS_EXCL[$user]:-0} + ${QG_SNAP_EXCL[$user]:-0} ))
+        local apparent_bytes=$(( ${QG_UPLOADS_RFER[$user]:-0} + ${QG_SNAP_RFER[$user]:-0} ))
+        local actual_size apparent_size
+        actual_size=$(bytes_to_mb "$actual_bytes")
+        apparent_size=$(bytes_to_mb "$apparent_bytes")
+
+        # Snapshot count and newest snapshot from a single directory listing
+        local range
+        range=$(get_snapshot_range "$home_dir/versions")
+        local snapshot_count="${range%%|*}"
+        local newest="${range##*|}"
+        local last_date="Never" last_epoch=0
+        if [ -n "$newest" ]; then
+            local ts
+            ts=$(snapshot_name_to_epoch "$newest")
+            last_epoch="${ts%%|*}"
+            if [ "$last_epoch" -gt 0 ]; then
+                last_date=$(date -d "@$last_epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "${ts#*|}")
+            fi
+        fi
+
+        local conn_info
+        conn_info=$(get_last_connection "$user")
+        local display_sftp="${conn_info%%|*}"
+        local conn_epoch="${conn_info##*|}"
+
+        local status_info
+        status_info=$(compute_user_status "$last_date" "$last_epoch" "$conn_epoch" "$now")
+        local status="${status_info%%|*}"
+        local status_color="${status_info#*|}"
+
+        local display_smb="N/A"
+        if [ "$any_samba" = true ] && has_samba_enabled "$user"; then
+            local smb_info
+            smb_info=$(get_last_samba_connection "$user")
+            display_smb="${smb_info%%|*}"
+        fi
+
+        local protocol
+        protocol=$(get_user_protocol "$user")
+
+        if [ "$any_samba" = true ]; then
+            if [ -n "$status_color" ]; then
+                printf "%-16s %12s %12s %6s %12s %23s %20s %20s ${status_color}%12s\033[0m\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$last_date" "$display_sftp" "$display_smb" "$status"
+            else
+                printf "%-16s %12s %12s %6s %12s %23s %20s %20s %12s\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$last_date" "$display_sftp" "$display_smb" "$status"
+            fi
+        else
+            if [ -n "$status_color" ]; then
+                printf "%-16s %12s %12s %6s %12s %23s %23s ${status_color}%12s\033[0m\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$last_date" "$display_sftp" "$status"
+            else
+                printf "%-16s %12s %12s %6s %12s %23s %23s %12s\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$last_date" "$display_sftp" "$status"
+            fi
+        fi
+
+        total_actual_bytes=$((total_actual_bytes + actual_bytes))
+        total_apparent_bytes=$((total_apparent_bytes + apparent_bytes))
+        total_users=$((total_users + 1))
+    done <<< "$users"
+
+    if [ "$any_samba" = true ]; then
+        echo "------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+    else
+        echo "--------------------------------------------------------------------------------------------------------------------------------------"
+    fi
+    printf "%-16s %12s %12s %6s %12s\n" "Total: $total_users" "$(bytes_to_mb "$total_actual_bytes")" "$(bytes_to_mb "$total_apparent_bytes")" "" ""
+
+    echo ""
+    echo "Note: Sizes come from Btrfs quota accounting (one qgroup query, no file walk)"
+    echo "      Size(MB) = exclusive bytes of uploads + all snapshots (physical usage)"
+    echo "      Apparent = referenced bytes of uploads + all snapshots (as independent copies)"
+    echo "      Data written before quotas were enabled is not attributed and is not counted"
+    echo "      Protocol shows available access methods (SFTP or SMB+SFTP)"
+    echo "      SMB* = Read-only versions access enabled (disable with 'disable-samba-versions <user>')"
+    echo "      Last Snapshot shows when the most recent snapshot was created"
+    echo "      Last SFTP shows most recent SSH/SFTP authentication"
+    if [ "$any_samba" = true ]; then
+        echo "      Last SMB shows most recent Samba/SMB connection (N/A if Samba not enabled for user)"
+    fi
+    echo "      Status meanings:"
+    echo "        ✓ OK           = Recent snapshot or connection with no changes (good!)"
+    echo "        ✓ No changes   = Backup job running but no file changes detected"
+    echo "        ⚠ NEVER USED   = User never connected"
+    echo "        ⚠ No snapshot  = Connected but no snapshot created yet"
+    echo "        ⚠ Xd ago       = Last snapshot more than 15 days old"
+    print_qgroup_inconsistency_note
+    return 0
+}
+
+# Fast info: per-user detail with sizes from quota accounting, including a
+# per-snapshot breakdown so figures can be checked against `btrfs qgroup show`
+info_user_fast() {
+    local username="$1"
+
+    if [ -z "$username" ]; then
+        echo "Error: Username is required" >&2
+        usage
+        exit 1
+    fi
+    if ! id "$username" &>/dev/null; then
+        echo "Error: User '$username' does not exist" >&2
+        exit 1
+    fi
+    local home_dir="/home/$username"
+    if [ ! -d "$home_dir" ]; then
+        echo "Error: Home directory not found for user '$username'" >&2
+        exit 1
+    fi
+
+    if ! build_qgroup_usage_cache /home; then
+        echo "Error: Btrfs quotas are not enabled on /home (required for info-fast)." >&2
+        echo "Enable with: btrfs quota enable --simple /home   (or re-run setup.sh)" >&2
+        exit 1
+    fi
+
+    echo "User Information (fast): $username"
+    echo "========================================"
+    echo "UID: $(id -u "$username")"
+    echo "Groups: $(groups "$username" | cut -d: -f2)"
+    echo "Home: $home_dir"
+    echo ""
+
+    build_connection_cache
+    build_samba_connection_cache
+    print_connection_activity "$username"
+    echo ""
+
+    # Disk usage from the qgroup cache
+    local uploads_rfer=${QG_UPLOADS_RFER[$username]:-0}
+    local uploads_excl=${QG_UPLOADS_EXCL[$username]:-0}
+    local snap_rfer=${QG_SNAP_RFER[$username]:-0}
+    local snap_excl=${QG_SNAP_EXCL[$username]:-0}
+    local snap_qgroups=${QG_SNAP_COUNT[$username]:-0}
+    local total_logical=$((uploads_rfer + snap_rfer))
+    local total_physical=$((uploads_excl + snap_excl))
+    local space_saved=$((total_logical - total_physical))
+    local efficiency_pct="0.0"
+    if [ "$total_logical" -gt 0 ]; then
+        efficiency_pct=$(awk -v s="$space_saved" -v l="$total_logical" 'BEGIN { printf "%.1f", (s / l) * 100 }')
+    fi
+
+    echo "Disk Usage (Btrfs quota accounting):"
+    if [ -z "${QG_UPLOADS_RFER[$username]+set}" ]; then
+        echo "  ⚠ No qgroup found for $home_dir/uploads (is it a Btrfs subvolume?)"
+    fi
+    echo "  Uploads:            $(bytes_to_mb "$uploads_rfer") MB referenced, $(bytes_to_mb "$uploads_excl") MB exclusive"
+    echo "  Snapshots (${snap_qgroups}):       $(bytes_to_mb "$snap_rfer") MB referenced, $(bytes_to_mb "$snap_excl") MB exclusive"
+    echo "  Total logical:      $(bytes_to_mb "$total_logical") MB (each subvolume as an independent copy)"
+    echo "  Physical usage:     $(bytes_to_mb "$total_physical") MB (exclusive bytes, with Btrfs deduplication)"
+    echo "  Space saved:        $(bytes_to_mb "$space_saved") MB (${efficiency_pct}% efficient)"
+    echo ""
+
+    # Quota information (same helper as `info`)
+    local quota_info
+    quota_info=$(get_user_quota "$username")
+    if [ -n "$quota_info" ]; then
+        local used_bytes="${quota_info%%|*}"
+        local limit_bytes
+        limit_bytes=$(echo "$quota_info" | cut -d'|' -f2)
+        local used_gb
+        used_gb=$(awk -v b="$used_bytes" 'BEGIN { printf "%.2f", b / 1073741824 }')
+        if [ "$limit_bytes" = "0" ]; then
+            echo "Storage Quota: Unlimited (${used_gb}GB used)"
+        else
+            local limit_gb usage_pct available_gb
+            limit_gb=$(awk -v b="$limit_bytes" 'BEGIN { printf "%.2f", b / 1073741824 }')
+            usage_pct=$(awk -v u="$used_bytes" -v l="$limit_bytes" 'BEGIN { printf "%.1f", (u / l) * 100 }')
+            available_gb=$(awk -v u="$used_bytes" -v l="$limit_bytes" 'BEGIN { printf "%.2f", (l - u) / 1073741824 }')
+            echo "Storage Quota: ${used_gb}GB / ${limit_gb}GB (${usage_pct}% used, ${available_gb}GB available)"
+            if [ "$(awk -v p="$usage_pct" 'BEGIN { print (p > 90) ? 1 : 0 }')" -eq 1 ]; then
+                echo "  ⚠ WARNING: Quota usage above 90%"
+            fi
+        fi
+    else
+        echo "Storage Quota: Unlimited (no quota set)"
+    fi
+    if [ -f "$home_dir/.terminas-quota-exceeded" ]; then
+        echo "  ⚠ Uploads are currently BLOCKED (.terminas-quota-exceeded present)"
+    fi
+    echo ""
+
+    # Snapshot statistics and per-snapshot breakdown
+    local versions_dir="$home_dir/versions"
+    local range
+    range=$(get_snapshot_range "$versions_dir")
+    local snapshot_count="${range%%|*}"
+    local rest="${range#*|}"
+    local oldest="${rest%%|*}"
+    local newest="${rest##*|}"
+
+    echo "Snapshots: $snapshot_count"
+    if [ "$snapshot_count" -gt 0 ]; then
+        local ts
+        ts=$(snapshot_name_to_epoch "$oldest")
+        echo "  Oldest:  $oldest"
+        echo "           Created: ${ts#*|}"
+        ts=$(snapshot_name_to_epoch "$newest")
+        echo "  Newest:  $newest"
+        echo "           Created: ${ts#*|}"
+        echo ""
+        printf "  %-21s %14s %14s\n" "Snapshot" "Referenced(MB)" "Exclusive(MB)"
+        local d name key
+        for d in "$versions_dir"/*/; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] || continue
+            key="$username/$name"
+            if [ -n "${QG_SNAP_RFER_BY_NAME[$key]+set}" ]; then
+                printf "  %-21s %14s %14s\n" "$name" "$(bytes_to_mb "${QG_SNAP_RFER_BY_NAME[$key]}")" "$(bytes_to_mb "${QG_SNAP_EXCL_BY_NAME[$key]}")"
+            else
+                printf "  %-21s %14s %14s\n" "$name" "n/a" "n/a"
+            fi
+        done
+        if [ "$snap_qgroups" -ne "$snapshot_count" ]; then
+            echo "  ⚠ Directory count ($snapshot_count) differs from qgroup count ($snap_qgroups)"
+        fi
+    fi
+    echo ""
+
+    echo "Current uploads: file count skipped (requires a full tree walk; use 'info' for it)"
+    echo ""
+
+    print_retention_policy "$username"
+    print_qgroup_inconsistency_note
+    return 0
+}
+
 # Show snapshot history for a user
 history_user() {
     local username="$1"
@@ -2950,6 +3387,17 @@ shift
 case "$command" in
     list|ls)
         list_users
+        ;;
+    list-fast|lsf)
+        list_users_fast
+        ;;
+    info-fast)
+        if [ $# -eq 0 ]; then
+            echo "Error: Username is required for info-fast command" >&2
+            usage
+            exit 1
+        fi
+        info_user_fast "$1"
         ;;
     info|show)
         if [ $# -eq 0 ]; then

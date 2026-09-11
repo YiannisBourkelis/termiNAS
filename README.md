@@ -558,6 +558,31 @@ Pending deletions after: 0
 ✓ Cleanup complete (non-blocking - kernel cleaner will reclaim space)
 ```
 
+**Fast listing and info (experimental):**
+```bash
+# Same columns as `list`, but sizes come from Btrfs quota accounting (no file walk)
+sudo ./src/server/manage_users.sh list-fast
+
+# Same as `info`, plus a per-snapshot Referenced/Exclusive breakdown
+sudo ./src/server/manage_users.sh info-fast <username>
+```
+
+`list` and `info` walk every file in every snapshot to compute sizes, which can take
+many minutes for users with very large directory trees. The `-fast` variants read
+all sizes from a single `btrfs qgroup show` call instead, so they finish in well under
+a second regardless of file count. They are provided side by side with the original
+commands so results and timings can be compared before the originals are replaced.
+
+Differences to be aware of:
+- **Size(MB)** is the sum of *Exclusive* bytes over uploads + all snapshots (physical usage
+  as attributed by simple quotas). **Apparent** is the sum of *Referenced* bytes (each
+  subvolume counted as an independent copy).
+- Data written before quotas were enabled is not attributed to any qgroup and is not counted.
+- If Btrfs reports its accounting as inconsistent, a warning is printed. Refresh with
+  `btrfs quota disable /home && btrfs quota enable --simple /home`, then reapply every
+  user's quota with `set-quota` (disabling quotas drops all qgroup limits).
+- `info-fast` skips the upload file count, since counting requires a full tree walk.
+
 #### macOS Time Machine Support
 
 termiNAS supports macOS Time Machine backups via Samba with automatic versioning using Btrfs snapshots.
