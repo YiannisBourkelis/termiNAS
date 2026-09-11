@@ -8,15 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`manage_users.sh list-fast` and `info-fast`** (experimental): compute all sizes from a single `btrfs qgroup show` call instead of walking every file, so they complete in well under a second regardless of file count. Provided alongside `list`/`info` for side-by-side comparison; `info-fast` includes a per-snapshot Referenced/Exclusive breakdown.
-- Shared helpers in `common.sh`: `build_qgroup_usage_cache` (one-pass qgroup parser keyed by user), `bytes_to_mb`, `get_snapshot_range`, `snapshot_name_to_epoch`.
-- Single-pass connection caches used by the `-fast` commands: SSH logins via one `journalctl -o short-unix --grep` query (no per-timestamp `date` subprocesses), Samba activity via one scan for all users instead of one journal scan per Samba user.
+- **`manage_users.sh refresh-sizes [user] [--force]`**: computes exact per-user sizes (physical via `btrfs filesystem du`, logical via a file walk) into `/var/terminas/cache/`. Users whose uploads generation and snapshot set are unchanged are skipped; each immutable snapshot's logical size is computed only once and pruned when the snapshot is deleted. Intended to run nightly from cron.
+- **`manage_users.sh list-fast` and `info-fast`** (experimental): same output as `list`/`info` but read the size cache instead of walking files, so they return instantly. `list-fast` marks rows whose data changed since their sizes were computed; `info-fast` shows a per-snapshot breakdown (cached logical size, file count, and quota-accounting Referenced/Exclusive). Provided side by side with the originals for comparison.
+- Incremental connection caches used by the `-fast` commands: SSH logins and Samba activity are read from journald with `--cursor-file`, so each run only reads entries added since the previous run instead of re-scanning 90 days (~13s on a busy server). SSH matching now includes `keyboard-interactive/pam` logins, which the original scan (password/publickey only) misses.
+- Shared helpers in `common.sh`: size-cache read/write/prune functions, `build_uploads_generation_cache`, `get_tree_physical_bytes`, `get_tree_logical`, `build_qgroup_usage_cache` (one-pass qgroup parser), `bytes_to_mb`, `get_snapshot_range`, `snapshot_name_to_epoch`.
 
 ### Fixed
 - Samba last-connection detection (in the `-fast` caches) no longer counts `disconnect` events as activity; the substring match for `connect` in the original implementation does.
 
 ### Notes
-- The alpha.4 changelog entry stating that `list` was switched to a single qgroup fetch was inaccurate: `list` still runs `btrfs filesystem du` per user. The `-fast` variants deliver that change.
+- Simple-quota (`squota`) accounting cannot report sizes of data written before quotas were enabled, and toggling quotas off/on resets attribution for all existing data. The `-fast` commands therefore use exact cached figures rather than qgroup numbers for sizes; qgroup data remains the basis for quota enforcement and is shown in `info-fast` for reference. The README no longer recommends toggling quotas to "refresh" accounting.
+- The alpha.4 changelog entry stating that `list` was switched to a single qgroup fetch was inaccurate: `list` still runs `btrfs filesystem du` per user.
 
 ## [1.0.0-alpha.4] - 2026-03-02
 

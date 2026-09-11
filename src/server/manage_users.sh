@@ -48,9 +48,10 @@ Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
     list                    List all backup users with disk usage and connection status
-    list-fast               Same as list, sizes from Btrfs quota accounting (no file walk; experimental)
+    list-fast               Same as list, reading cached sizes (instant; experimental)
     info <username>         Show detailed information including connection activity
-    info-fast <username>    Same as info, sizes from Btrfs quota accounting with per-snapshot breakdown (experimental)
+    info-fast <username>    Same as info, reading cached sizes, with per-snapshot breakdown (experimental)
+    refresh-sizes [username] [--force]  Compute exact sizes into the cache used by list-fast/info-fast
     history <username>      Show snapshot history for a user
     search <pattern>        Search for files in latest snapshots
     inactive [days]         List users with no recent uploads (default: 30 days)
@@ -660,9 +661,12 @@ build_connection_cache() {
     fi
 }
 
-# Fast SSH connection cache: single journal query with native timestamps and
-# native filtering, so no per-timestamp `date` subprocesses and no year-rollover
-# guessing. Falls back to the original implementation when journald is absent.
+# Incremental SSH login cache. Reads the journal with native timestamps and
+# native filtering, and keeps a cursor so each run only reads entries added
+# since the previous run (a full 90-day read costs ~13s on a busy server; the
+# incremental read is nearly free). Matches every "Accepted <method> for"
+# line, including keyboard-interactive/pam which Debian uses for passwords.
+# Falls back to the original implementation when journald is absent.
 build_connection_cache_fast() {
     declare -gA CONNECTION_CACHE=()
 
@@ -670,44 +674,71 @@ build_connection_cache_fast() {
         build_connection_cache
         return
     fi
+    ensure_cache_dir || { build_connection_cache; return; }
 
-    local user epoch formatted
+    local state="$TERMINAS_CACHE_DIR/ssh_logins"
+    local cursor="$TERMINAS_CACHE_DIR/ssh_logins.cursor"
+    declare -A last=()
+    local user epoch
+
+    if [ -s "$state" ]; then
+        while IFS='|' read -r user epoch; do
+            [ -n "$user" ] && last[$user]="$epoch"
+        done < "$state"
+    fi
+
+    local args=(-u ssh.service -u sshd.service --since "90 days ago" -o short-unix --no-pager --grep 'Accepted \S+ for ')
+    local tmp
+    tmp=$(mktemp)
+    if ! journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null; then
+        # Cursor may point at a vacuumed journal entry: start over
+        rm -f "$cursor"
+        journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null || true
+    fi
+
     while IFS='|' read -r user epoch; do
-        [ -n "$user" ] && [ "${epoch:-0}" -gt 0 ] || continue
-        formatted=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
-        CONNECTION_CACHE[$user]="$formatted|$epoch"
-    done < <(journalctl -u ssh.service -u sshd.service --since "90 days ago" -o short-unix --no-pager \
-                --grep 'Accepted (password|publickey) for' 2>/dev/null | \
-        awk '{
+        [ -n "$user" ] || continue
+        if [ "${epoch:-0}" -gt "${last[$user]:-0}" ]; then
+            last[$user]="$epoch"
+        fi
+    done < <(awk '{
             ts = int($1)
             for (i = 1; i <= NF; i++) {
                 if ($i == "for") {
                     u = $(i + 1)
-                    if (!(u in last) || ts > last[u]) last[u] = ts
+                    if (!(u in l) || ts > l[u]) l[u] = ts
                     break
                 }
             }
         }
-        END { for (u in last) print u "|" last[u] }')
+        END { for (u in l) print u "|" l[u] }' "$tmp")
+    rm -f "$tmp"
+
+    : > "$state.tmp"
+    for user in "${!last[@]}"; do
+        echo "$user|${last[$user]}" >> "$state.tmp"
+        CONNECTION_CACHE[$user]="$(date -d "@${last[$user]}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")|${last[$user]}"
+    done
+    mv -f "$state.tmp" "$state"
 }
 
-# Fast Samba connection cache: ONE pass over the audit source for all users
-# (the original scans the journal once per Samba-enabled user).
-# Audit payload format: user|ip|machine|operation|... (last field of the line)
+# Incremental Samba activity cache: one pass for all users (the original
+# scans the journal once per Samba user), with a journal cursor like the SSH
+# cache. Audit payload format: user|ip|machine|operation|... (last field).
+# When /var/log/samba/audit.log is in use it is scanned in a single pass
+# (log files rotate, so no cursor is kept for them).
 build_samba_connection_cache_fast() {
     declare -gA SAMBA_CONNECTION_CACHE=()
 
     local audit_log="/var/log/samba/audit.log"
-    local current_epoch
-    current_epoch=$(date +%s)
+    local user epoch
 
-    local user epoch formatted
     if [ -s "$audit_log" ]; then
-        # Syslog-style lines without a year: "Mon DD HH:MM:SS host ... user|ip|machine|op"
+        local current_epoch
+        current_epoch=$(date +%s)
         while IFS='|' read -r user epoch; do
             [ -n "$user" ] && [ "${epoch:-0}" -gt 0 ] || continue
-            formatted=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
-            SAMBA_CONNECTION_CACHE[$user]="$formatted|$epoch"
+            SAMBA_CONNECTION_CACHE[$user]="$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")|$epoch"
         done < <(awk -v current_epoch="$current_epoch" '
             /^[A-Za-z]/ {
                 n = split($NF, f, "|")
@@ -720,23 +751,52 @@ build_samba_connection_cache_fast() {
                     cache[ts] = e
                 }
                 e = cache[ts]
-                if (!(f[1] in last) || e > last[f[1]]) last[f[1]] = e
+                if (!(f[1] in l) || e > l[f[1]]) l[f[1]] = e
             }
-            END { for (u in last) print u "|" last[u] }' "$audit_log")
-    elif command -v journalctl &>/dev/null; then
-        while IFS='|' read -r user epoch; do
-            [ -n "$user" ] && [ "${epoch:-0}" -gt 0 ] || continue
-            formatted=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
-            SAMBA_CONNECTION_CACHE[$user]="$formatted|$epoch"
-        done < <(journalctl --since "30 days ago" SYSLOG_IDENTIFIER=smbd_audit -o short-unix --no-pager 2>/dev/null | \
-            awk '{
-                n = split($NF, f, "|")
-                if (n < 4 || f[4] !~ /^(connect|write|pwrite|close)$/) next
-                ts = int($1)
-                if (!(f[1] in last) || ts > last[f[1]]) last[f[1]] = ts
-            }
-            END { for (u in last) print u "|" last[u] }')
+            END { for (u in l) print u "|" l[u] }' "$audit_log")
+        return
     fi
+
+    command -v journalctl &>/dev/null || return 0
+    ensure_cache_dir || return 0
+
+    local state="$TERMINAS_CACHE_DIR/smb_activity"
+    local cursor="$TERMINAS_CACHE_DIR/smb_activity.cursor"
+    declare -A last=()
+    if [ -s "$state" ]; then
+        while IFS='|' read -r user epoch; do
+            [ -n "$user" ] && last[$user]="$epoch"
+        done < "$state"
+    fi
+
+    local args=(SYSLOG_IDENTIFIER=smbd_audit --since "30 days ago" -o short-unix --no-pager)
+    local tmp
+    tmp=$(mktemp)
+    if ! journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null; then
+        rm -f "$cursor"
+        journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null || true
+    fi
+
+    while IFS='|' read -r user epoch; do
+        [ -n "$user" ] || continue
+        if [ "${epoch:-0}" -gt "${last[$user]:-0}" ]; then
+            last[$user]="$epoch"
+        fi
+    done < <(awk '{
+            n = split($NF, f, "|")
+            if (n < 4 || f[4] !~ /^(connect|write|pwrite|close)$/) next
+            ts = int($1)
+            if (!(f[1] in l) || ts > l[f[1]]) l[f[1]] = ts
+        }
+        END { for (u in l) print u "|" l[u] }' "$tmp")
+    rm -f "$tmp"
+
+    : > "$state.tmp"
+    for user in "${!last[@]}"; do
+        echo "$user|${last[$user]}" >> "$state.tmp"
+        SAMBA_CONNECTION_CACHE[$user]="$(date -d "@${last[$user]}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")|${last[$user]}"
+    done
+    mv -f "$state.tmp" "$state"
 }
 
 # Get last connection time for a user from cache
@@ -2227,18 +2287,11 @@ info_user() {
 # ---------------------------------------------------------------------------
 # Fast variants (list-fast / info-fast)
 # ---------------------------------------------------------------------------
-# These compute sizes from Btrfs quota accounting (one `btrfs qgroup show`
-# call, see build_qgroup_usage_cache in common.sh) instead of walking every
-# file. They exist alongside `list`/`info` so results and timings can be
-# compared on real data before the slow implementations are replaced.
-#
-# Size semantics differ slightly from the filesystem-walk versions:
-#   Size(MB)  = sum of Exclusive bytes over uploads + all snapshots
-#               (physical footprint as attributed by simple quotas)
-#   Apparent  = sum of Referenced bytes over uploads + all snapshots
-#               (each subvolume counted as an independent copy)
-# Extents written before quotas were enabled are not attributed to any
-# qgroup and therefore do not appear in these figures.
+# These read exact sizes from the cache maintained by `refresh-sizes` (see the
+# size-cache helpers in common.sh) instead of walking every file on each run,
+# and use incremental journal caches for connection times. They exist
+# alongside `list`/`info` so results and timings can be compared on real data
+# before the slow implementations are replaced.
 
 # Determine the status text/color for a user from snapshot and connection times.
 # Args: $1 = last snapshot date ("Never" or formatted), $2 = last snapshot epoch,
@@ -2384,19 +2437,15 @@ print_qgroup_inconsistency_note() {
     return 0
 }
 
-# Fast list: same columns as `list`, sizes from quota accounting
+# Fast list: same columns as `list`; sizes read from the size cache written by
+# `refresh-sizes` (exact figures, computed in the background). Rows whose data
+# changed since the cache was computed are marked with '*'.
 list_users_fast() {
     local users
     users=$(get_backup_users)
     if [ -z "$users" ]; then
         echo "No backup users found."
         return
-    fi
-
-    if ! build_qgroup_usage_cache /home; then
-        echo "Error: Btrfs quotas are not enabled on /home (required for list-fast)." >&2
-        echo "Enable with: btrfs quota enable --simple /home   (or re-run setup.sh)" >&2
-        return 1
     fi
 
     local any_samba=false
@@ -2423,8 +2472,11 @@ list_users_fast() {
     if [ "$any_samba" = true ]; then
         build_samba_connection_cache_fast
     fi
+    build_uploads_generation_cache /home
 
     local total_actual_bytes=0 total_apparent_bytes=0 total_users=0
+    local missing=0 stale=0
+    local oldest_computed=0 newest_computed=0
     local now
     now=$(date +%s)
 
@@ -2432,13 +2484,6 @@ list_users_fast() {
         [ -n "$user" ] || continue
         local home_dir="/home/$user"
         [ -d "$home_dir" ] || continue
-
-        # Sizes straight from the qgroup cache (no filesystem walk)
-        local actual_bytes=$(( ${QG_UPLOADS_EXCL[$user]:-0} + ${QG_SNAP_EXCL[$user]:-0} ))
-        local apparent_bytes=$(( ${QG_UPLOADS_RFER[$user]:-0} + ${QG_SNAP_RFER[$user]:-0} ))
-        local actual_size apparent_size
-        actual_size=$(bytes_to_mb "$actual_bytes")
-        apparent_size=$(bytes_to_mb "$apparent_bytes")
 
         # Snapshot count and newest snapshot from a single directory listing
         local range
@@ -2453,6 +2498,29 @@ list_users_fast() {
             if [ "$last_epoch" -gt 0 ]; then
                 last_date=$(date -d "@$last_epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "${ts#*|}")
             fi
+        fi
+
+        # Sizes from the cache; mark rows whose data changed since computed
+        local actual_size="n/a" apparent_size="n/a" marker=""
+        if read_size_cache "$user"; then
+            local actual_bytes=$SC_PHYSICAL
+            local apparent_bytes=$((SC_UP_LOGICAL + SC_SNAP_LOGICAL))
+            local snapset
+            snapset=$(get_snapshot_set "$user")
+            if [ "${UPLOADS_GEN[$user]:-}" != "$SC_GEN" ] || [ "$snapset" != "$SC_SNAPSET" ]; then
+                marker="*"
+                stale=$((stale + 1))
+            fi
+            actual_size="$(bytes_to_mb "$actual_bytes")$marker"
+            apparent_size="$(bytes_to_mb "$apparent_bytes")$marker"
+            total_actual_bytes=$((total_actual_bytes + actual_bytes))
+            total_apparent_bytes=$((total_apparent_bytes + apparent_bytes))
+            if [ "$oldest_computed" -eq 0 ] || [ "$SC_COMPUTED" -lt "$oldest_computed" ]; then
+                oldest_computed=$SC_COMPUTED
+            fi
+            [ "$SC_COMPUTED" -gt "$newest_computed" ] && newest_computed=$SC_COMPUTED
+        else
+            missing=$((missing + 1))
         fi
 
         local conn_info
@@ -2489,8 +2557,6 @@ list_users_fast() {
             fi
         fi
 
-        total_actual_bytes=$((total_actual_bytes + actual_bytes))
-        total_apparent_bytes=$((total_apparent_bytes + apparent_bytes))
         total_users=$((total_users + 1))
     done <<< "$users"
 
@@ -2502,10 +2568,18 @@ list_users_fast() {
     printf "%-16s %12s %12s %6s %12s\n" "Total: $total_users" "$(bytes_to_mb "$total_actual_bytes")" "$(bytes_to_mb "$total_apparent_bytes")" "" ""
 
     echo ""
-    echo "Note: Sizes come from Btrfs quota accounting (one qgroup query, no file walk)"
-    echo "      Size(MB) = exclusive bytes of uploads + all snapshots (physical usage)"
-    echo "      Apparent = referenced bytes of uploads + all snapshots (as independent copies)"
-    echo "      Data written before quotas were enabled is not attributed and is not counted"
+    echo "Note: Size(MB) shows physical disk usage with Btrfs deduplication"
+    echo "      Apparent shows logical size (sum of all files as if independent copies)"
+    echo "      The difference shows space saved by Btrfs CoW snapshots"
+    if [ "$oldest_computed" -gt 0 ]; then
+        echo "      Sizes are cached by 'refresh-sizes'; computed between $(date -d "@$oldest_computed" "+%Y-%m-%d %H:%M") and $(date -d "@$newest_computed" "+%Y-%m-%d %H:%M")"
+    fi
+    if [ "$stale" -gt 0 ]; then
+        echo "      * = data changed since the size was computed ($stale user(s); run: $SCRIPT_NAME refresh-sizes)"
+    fi
+    if [ "$missing" -gt 0 ]; then
+        echo "      n/a = no cached size yet for $missing user(s); run: $SCRIPT_NAME refresh-sizes"
+    fi
     echo "      Protocol shows available access methods (SFTP or SMB+SFTP)"
     echo "      SMB* = Read-only versions access enabled (disable with 'disable-samba-versions <user>')"
     echo "      Last Snapshot shows when the most recent snapshot was created"
@@ -2519,12 +2593,11 @@ list_users_fast() {
     echo "        ⚠ NEVER USED   = User never connected"
     echo "        ⚠ No snapshot  = Connected but no snapshot created yet"
     echo "        ⚠ Xd ago       = Last snapshot more than 15 days old"
-    print_qgroup_inconsistency_note
     return 0
 }
 
-# Fast info: per-user detail with sizes from quota accounting, including a
-# per-snapshot breakdown so figures can be checked against `btrfs qgroup show`
+# Fast info: per-user detail with cached exact sizes plus the quota-accounting
+# view (Referenced/Exclusive per snapshot) for cross-checking.
 info_user_fast() {
     local username="$1"
 
@@ -2543,12 +2616,6 @@ info_user_fast() {
         exit 1
     fi
 
-    if ! build_qgroup_usage_cache /home; then
-        echo "Error: Btrfs quotas are not enabled on /home (required for info-fast)." >&2
-        echo "Enable with: btrfs quota enable --simple /home   (or re-run setup.sh)" >&2
-        exit 1
-    fi
-
     echo "User Information (fast): $username"
     echo "========================================"
     echo "UID: $(id -u "$username")"
@@ -2563,29 +2630,31 @@ info_user_fast() {
     print_connection_activity "$username"
     echo ""
 
-    # Disk usage from the qgroup cache
-    local uploads_rfer=${QG_UPLOADS_RFER[$username]:-0}
-    local uploads_excl=${QG_UPLOADS_EXCL[$username]:-0}
-    local snap_rfer=${QG_SNAP_RFER[$username]:-0}
-    local snap_excl=${QG_SNAP_EXCL[$username]:-0}
-    local snap_qgroups=${QG_SNAP_COUNT[$username]:-0}
-    local total_logical=$((uploads_rfer + snap_rfer))
-    local total_physical=$((uploads_excl + snap_excl))
-    local space_saved=$((total_logical - total_physical))
-    local efficiency_pct="0.0"
-    if [ "$total_logical" -gt 0 ]; then
-        efficiency_pct=$(awk -v s="$space_saved" -v l="$total_logical" 'BEGIN { printf "%.1f", (s / l) * 100 }')
+    # Cached exact sizes
+    build_uploads_generation_cache /home
+    if read_size_cache "$username"; then
+        local total_logical=$((SC_UP_LOGICAL + SC_SNAP_LOGICAL))
+        local space_saved=$((total_logical - SC_PHYSICAL))
+        # Physical can slightly exceed logical (metadata, small-file overhead)
+        [ "$space_saved" -lt 0 ] && space_saved=0
+        local efficiency_pct="0.0"
+        if [ "$total_logical" -gt 0 ]; then
+            efficiency_pct=$(awk -v s="$space_saved" -v l="$total_logical" 'BEGIN { printf "%.1f", (s / l) * 100 }')
+        fi
+        echo "Disk Usage (computed $(date -d "@$SC_COMPUTED" "+%Y-%m-%d %H:%M")):"
+        echo "  Uploads:            $(bytes_to_mb "$SC_UP_LOGICAL") MB (current files)"
+        echo "  Snapshots (${SC_SNAP_COUNT}):       $(bytes_to_mb "$SC_SNAP_LOGICAL") MB (logical size)"
+        echo "  Total logical:      $(bytes_to_mb "$total_logical") MB (sum of all files)"
+        echo "  Physical usage:     $(bytes_to_mb "$SC_PHYSICAL") MB (with Btrfs deduplication)"
+        echo "  Space saved:        $(bytes_to_mb "$space_saved") MB (${efficiency_pct}% efficient)"
+        local snapset
+        snapset=$(get_snapshot_set "$username")
+        if [ "${UPLOADS_GEN[$username]:-}" != "$SC_GEN" ] || [ "$snapset" != "$SC_SNAPSET" ]; then
+            echo "  ⚠ Data changed since these figures were computed - run: $SCRIPT_NAME refresh-sizes $username"
+        fi
+    else
+        echo "Disk Usage: not cached yet - run: $SCRIPT_NAME refresh-sizes $username"
     fi
-
-    echo "Disk Usage (Btrfs quota accounting):"
-    if [ -z "${QG_UPLOADS_RFER[$username]+set}" ]; then
-        echo "  ⚠ No qgroup found for $home_dir/uploads (is it a Btrfs subvolume?)"
-    fi
-    echo "  Uploads:            $(bytes_to_mb "$uploads_rfer") MB referenced, $(bytes_to_mb "$uploads_excl") MB exclusive"
-    echo "  Snapshots (${snap_qgroups}):       $(bytes_to_mb "$snap_rfer") MB referenced, $(bytes_to_mb "$snap_excl") MB exclusive"
-    echo "  Total logical:      $(bytes_to_mb "$total_logical") MB (each subvolume as an independent copy)"
-    echo "  Physical usage:     $(bytes_to_mb "$total_physical") MB (exclusive bytes, with Btrfs deduplication)"
-    echo "  Space saved:        $(bytes_to_mb "$space_saved") MB (${efficiency_pct}% efficient)"
     echo ""
 
     # Quota information (same helper as `info`)
@@ -2597,7 +2666,7 @@ info_user_fast() {
         limit_bytes=$(echo "$quota_info" | cut -d'|' -f2)
         local used_gb
         used_gb=$(awk -v b="$used_bytes" 'BEGIN { printf "%.2f", b / 1073741824 }')
-        if [ "$limit_bytes" = "0" ]; then
+        if [ "$limit_bytes" = "0" ] || ! [[ "$limit_bytes" =~ ^[0-9]+$ ]]; then
             echo "Storage Quota: Unlimited (${used_gb}GB used)"
         else
             local limit_gb usage_pct available_gb
@@ -2617,7 +2686,7 @@ info_user_fast() {
     fi
     echo ""
 
-    # Snapshot statistics and per-snapshot breakdown
+    # Snapshot statistics with cached logical size and quota-accounting view
     local versions_dir="$home_dir/versions"
     local range
     range=$(get_snapshot_range "$versions_dir")
@@ -2636,31 +2705,146 @@ info_user_fast() {
         echo "  Newest:  $newest"
         echo "           Created: ${ts#*|}"
         echo ""
-        printf "  %-21s %14s %14s\n" "Snapshot" "Referenced(MB)" "Exclusive(MB)"
-        local d name key
+
+        local have_qgroups=false
+        build_qgroup_usage_cache /home && have_qgroups=true
+        printf "  %-21s %12s %9s %14s %14s\n" "Snapshot" "Logical(MB)" "Files" "Referenced(MB)" "Exclusive(MB)"
+        local d name key entry logical_col files_col rfer_col excl_col
         for d in "$versions_dir"/*/; do
             [ -d "$d" ] || continue
             name=$(basename "$d")
             [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] || continue
-            key="$username/$name"
-            if [ -n "${QG_SNAP_RFER_BY_NAME[$key]+set}" ]; then
-                printf "  %-21s %14s %14s\n" "$name" "$(bytes_to_mb "${QG_SNAP_RFER_BY_NAME[$key]}")" "$(bytes_to_mb "${QG_SNAP_EXCL_BY_NAME[$key]}")"
-            else
-                printf "  %-21s %14s %14s\n" "$name" "n/a" "n/a"
+            logical_col="n/a"; files_col="n/a"; rfer_col="n/a"; excl_col="n/a"
+            if [ -s "$TERMINAS_CACHE_DIR/snapshots/$username/$name" ]; then
+                entry=$(cat "$TERMINAS_CACHE_DIR/snapshots/$username/$name")
+                logical_col=$(bytes_to_mb "${entry%%|*}")
+                files_col="${entry##*|}"
             fi
+            key="$username/$name"
+            if [ "$have_qgroups" = true ] && [ -n "${QG_SNAP_RFER_BY_NAME[$key]+set}" ]; then
+                rfer_col=$(bytes_to_mb "${QG_SNAP_RFER_BY_NAME[$key]}")
+                excl_col=$(bytes_to_mb "${QG_SNAP_EXCL_BY_NAME[$key]}")
+            fi
+            printf "  %-21s %12s %9s %14s %14s\n" "$name" "$logical_col" "$files_col" "$rfer_col" "$excl_col"
         done
-        if [ "$snap_qgroups" -ne "$snapshot_count" ]; then
-            echo "  ⚠ Directory count ($snapshot_count) differs from qgroup count ($snap_qgroups)"
-        fi
+        echo "  (Referenced/Exclusive come from simple-quota accounting and only cover data written after quotas were enabled)"
     fi
     echo ""
 
-    echo "Current uploads: file count skipped (requires a full tree walk; use 'info' for it)"
+    if read_size_cache "$username"; then
+        echo "Current uploads: $SC_UP_FILES files (as of $(date -d "@$SC_COMPUTED" "+%Y-%m-%d %H:%M"))"
+    else
+        echo "Current uploads: not cached yet"
+    fi
     echo ""
 
     print_retention_policy "$username"
     print_qgroup_inconsistency_note
     return 0
+}
+
+# Compute exact sizes for one user into the cache. Skips the expensive work
+# when nothing changed since the last run (uploads generation and snapshot set
+# unchanged) unless force=true. Snapshots are only ever computed once.
+# Usage: refresh_user_sizes <user> [force]
+refresh_user_sizes() {
+    local user="$1"
+    local force="${2:-false}"
+    local home_dir="/home/$user"
+
+    if [ ! -d "$home_dir/uploads" ]; then
+        echo "  $user: skipped (no uploads directory)"
+        return 0
+    fi
+
+    local started
+    started=$(date +%s)
+
+    local snap_info
+    snap_info=$(refresh_snapshot_size_cache "$user") || { echo "  $user: ERROR updating snapshot cache" >&2; return 1; }
+    local snap_logical snap_files snap_count snap_new rest
+    snap_logical="${snap_info%%|*}"; rest="${snap_info#*|}"
+    snap_files="${rest%%|*}"; rest="${rest#*|}"
+    snap_count="${rest%%|*}"; snap_new="${rest##*|}"
+
+    local gen="${UPLOADS_GEN[$user]:-}"
+    local snapset
+    snapset=$(get_snapshot_set "$user")
+
+    if [ "$force" != true ] && [ -n "$gen" ] && read_size_cache "$user" \
+       && [ "$SC_GEN" = "$gen" ] && [ "$SC_SNAPSET" = "$snapset" ]; then
+        echo "  $user: unchanged since $(date -d "@$SC_COMPUTED" "+%Y-%m-%d %H:%M") (generation $gen), kept"
+        return 0
+    fi
+
+    local up_info
+    up_info=$(get_tree_logical "$home_dir/uploads")
+    local up_logical="${up_info%%|*}" up_files="${up_info##*|}"
+    local physical
+    physical=$(get_tree_physical_bytes "$home_dir")
+    [[ "$physical" =~ ^[0-9]+$ ]] || physical=0
+
+    write_size_cache "$user" "$physical" "$up_logical" "$up_files" "$snap_logical" "$snap_files" "$snap_count" "$gen" "$snapset" \
+        || { echo "  $user: ERROR writing cache" >&2; return 1; }
+
+    local elapsed=$(( $(date +%s) - started ))
+    echo "  $user: physical $(bytes_to_mb "$physical") MB, uploads $(bytes_to_mb "$up_logical") MB ($up_files files), $snap_count snapshots ($snap_new newly computed) - ${elapsed}s"
+    return 0
+}
+
+# refresh-sizes [username] [--force]
+refresh_sizes() {
+    local target="" force=false arg
+    for arg in "$@"; do
+        case "$arg" in
+            --force|-f) force=true ;;
+            *) target="$arg" ;;
+        esac
+    done
+
+    if ! ensure_cache_dir; then
+        echo "Error: cannot create cache directory $TERMINAS_CACHE_DIR" >&2
+        return 1
+    fi
+    build_uploads_generation_cache /home
+
+    local users
+    if [ -n "$target" ]; then
+        if ! id "$target" &>/dev/null; then
+            echo "Error: User '$target' does not exist" >&2
+            return 1
+        fi
+        users="$target"
+    else
+        users=$(get_backup_users)
+    fi
+    if [ -z "$users" ]; then
+        echo "No backup users found."
+        return 0
+    fi
+
+    echo "Refreshing size cache in $TERMINAS_CACHE_DIR ..."
+    local started
+    started=$(date +%s)
+    local user failed=0
+    while IFS= read -r user; do
+        [ -n "$user" ] || continue
+        refresh_user_sizes "$user" "$force" || failed=$((failed + 1))
+    done <<< "$users"
+
+    # Drop caches of users that no longer exist
+    local f
+    for f in "$TERMINAS_CACHE_DIR/sizes"/*; do
+        [ -f "$f" ] || continue
+        user=$(basename "$f")
+        if ! id "$user" &>/dev/null; then
+            remove_size_cache "$user"
+            echo "  removed stale cache for deleted user $user"
+        fi
+    done
+
+    echo "Done in $(( $(date +%s) - started ))s${failed:+ ($failed error(s))}"
+    [ "$failed" -eq 0 ]
 }
 
 # Show snapshot history for a user
@@ -3481,6 +3665,9 @@ case "$command" in
             exit 1
         fi
         info_user_fast "$1"
+        ;;
+    refresh-sizes)
+        refresh_sizes "$@"
         ;;
     info|show)
         if [ $# -eq 0 ]; then

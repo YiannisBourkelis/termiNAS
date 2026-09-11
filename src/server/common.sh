@@ -258,3 +258,171 @@ snapshot_name_to_epoch() {
         echo "0|Unknown"
     fi
 }
+
+# ---------------------------------------------------------------------------
+# Size cache: exact figures computed in the background, read instantly
+# ---------------------------------------------------------------------------
+# Walking every file (logical size) and `btrfs filesystem du` (physical size)
+# take minutes on large trees, so they are computed by `refresh-sizes` (cron
+# or on demand) and stored here. Snapshots are immutable, so each snapshot's
+# logical size is computed exactly once and kept until the snapshot is deleted.
+#
+# Layout:
+#   $TERMINAS_CACHE_DIR/sizes/<user>            key=value lines (see write_size_cache)
+#   $TERMINAS_CACHE_DIR/snapshots/<user>/<snap> "<logical bytes>|<file count>"
+TERMINAS_CACHE_DIR="${TERMINAS_CACHE_DIR:-/var/terminas/cache}"
+
+ensure_cache_dir() {
+    mkdir -p "$TERMINAS_CACHE_DIR/sizes" "$TERMINAS_CACHE_DIR/snapshots" 2>/dev/null || return 1
+    chmod 700 "$TERMINAS_CACHE_DIR" 2>/dev/null || true
+    return 0
+}
+
+# Physical usage of a tree in bytes (exclusive + set-shared from
+# `btrfs filesystem du --raw`), falling back to `du` when btrfs fails.
+# Usage: get_tree_physical_bytes <path>
+get_tree_physical_bytes() {
+    local path="$1"
+    local line
+    line=$(btrfs filesystem du -s --raw "$path" 2>/dev/null | tail -1)
+    if [ -n "$line" ] && [[ "$line" =~ ^[[:space:]]*[0-9]+[[:space:]]+[0-9]+ ]]; then
+        # Columns: Total Exclusive Set-shared Filename ("-" when not applicable)
+        echo "$line" | awk '{ s = ($3 == "-") ? 0 : $3; printf "%.0f", $2 + s }'
+        return 0
+    fi
+    du -s -B1 "$path" 2>/dev/null | awk '{ print $1 }'
+}
+
+# Logical size (sum of file sizes) and file count of a tree.
+# Prints "<bytes>|<files>"
+# Usage: get_tree_logical <path>
+get_tree_logical() {
+    local path="$1"
+    find "$path" -type f -printf '%s\n' 2>/dev/null | awk '{ s += $1; n++ } END { printf "%.0f|%d", s, n }'
+}
+
+# Populate UPLOADS_GEN[user] (Btrfs generation of each uploads subvolume) from
+# ONE `btrfs subvolume list -g` call. The generation changes whenever anything
+# inside the subvolume changes, so it is a cheap "has the data changed?" key.
+# Usage: build_uploads_generation_cache [mountpoint]
+build_uploads_generation_cache() {
+    local mount="${1:-/home}"
+    declare -gA UPLOADS_GEN=()
+    local gen path user
+    while IFS='|' read -r gen path; do
+        [ -n "$path" ] || continue
+        path="${path%/uploads}"
+        user="${path##*/}"
+        UPLOADS_GEN["$user"]="$gen"
+    done < <(btrfs subvolume list -g "$mount" 2>/dev/null | awk '
+        $NF ~ /\/uploads$/ {
+            for (i = 1; i < NF; i++) if ($i == "gen") { print $(i + 1) "|" $NF; break }
+        }')
+}
+
+# Current snapshot names of a user as a comma-separated, sorted list.
+# Usage: get_snapshot_set <user>
+get_snapshot_set() {
+    local user="$1"
+    local d name names=""
+    for d in "/home/$user/versions"/*/; do
+        [ -d "$d" ] || continue
+        name=$(basename "$d")
+        [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] || continue
+        names="${names:+$names,}$name"
+    done
+    echo "$names"
+}
+
+# Read a user's size cache into SC_* globals. Returns 1 if there is no cache.
+# Usage: read_size_cache <user>
+read_size_cache() {
+    local user="$1"
+    local f="$TERMINAS_CACHE_DIR/sizes/$user"
+    SC_COMPUTED=0 SC_PHYSICAL=0 SC_UP_LOGICAL=0 SC_UP_FILES=0 SC_SNAP_LOGICAL=0 SC_SNAP_FILES=0 SC_SNAP_COUNT=0 SC_GEN="" SC_SNAPSET=""
+    [ -s "$f" ] || return 1
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in
+            computed_epoch)         SC_COMPUTED="$v" ;;
+            physical_bytes)         SC_PHYSICAL="$v" ;;
+            uploads_logical_bytes)  SC_UP_LOGICAL="$v" ;;
+            uploads_files)          SC_UP_FILES="$v" ;;
+            snapshots_logical_bytes) SC_SNAP_LOGICAL="$v" ;;
+            snapshots_files)        SC_SNAP_FILES="$v" ;;
+            snapshot_count)         SC_SNAP_COUNT="$v" ;;
+            uploads_gen)            SC_GEN="$v" ;;
+            snapshot_set)           SC_SNAPSET="$v" ;;
+        esac
+    done < "$f"
+    return 0
+}
+
+# Write a user's size cache atomically.
+# Usage: write_size_cache <user> <physical> <up_logical> <up_files> <snap_logical> <snap_files> <snap_count> <gen> <snapset>
+write_size_cache() {
+    local user="$1"
+    local f="$TERMINAS_CACHE_DIR/sizes/$user"
+    ensure_cache_dir || return 1
+    {
+        echo "computed_epoch=$(date +%s)"
+        echo "physical_bytes=$2"
+        echo "uploads_logical_bytes=$3"
+        echo "uploads_files=$4"
+        echo "snapshots_logical_bytes=$5"
+        echo "snapshots_files=$6"
+        echo "snapshot_count=$7"
+        echo "uploads_gen=$8"
+        echo "snapshot_set=$9"
+    } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+# Remove a user's size cache (call from delete_user.sh)
+# Usage: remove_size_cache <user>
+remove_size_cache() {
+    local user="$1"
+    rm -f "$TERMINAS_CACHE_DIR/sizes/$user" 2>/dev/null || true
+    rm -rf "${TERMINAS_CACHE_DIR:?}/snapshots/$user" 2>/dev/null || true
+}
+
+# Ensure every current snapshot of a user has a cached logical size (computing
+# only the missing ones - snapshots are immutable) and drop entries for deleted
+# snapshots. Prints "<total logical bytes>|<total files>|<count>|<newly computed>".
+# Usage: refresh_snapshot_size_cache <user>
+refresh_snapshot_size_cache() {
+    local user="$1"
+    local snapdir="$TERMINAS_CACHE_DIR/snapshots/$user"
+    mkdir -p "$snapdir" 2>/dev/null || return 1
+
+    local snapset
+    snapset=$(get_snapshot_set "$user")
+    local total_bytes=0 total_files=0 count=0 computed=0
+    local name entry
+    if [ -n "$snapset" ]; then
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            if [ ! -s "$snapdir/$name" ]; then
+                entry=$(get_tree_logical "/home/$user/versions/$name")
+                echo "$entry" > "$snapdir/$name"
+                computed=$((computed + 1))
+            fi
+            entry=$(cat "$snapdir/$name")
+            total_bytes=$((total_bytes + ${entry%%|*}))
+            total_files=$((total_files + ${entry##*|}))
+            count=$((count + 1))
+        done <<< "${snapset//,/$'\n'}"
+    fi
+
+    # Prune entries for snapshots that no longer exist
+    local f
+    for f in "$snapdir"/*; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        case ",$snapset," in
+            *",$name,"*) ;;
+            *) rm -f "$f" ;;
+        esac
+    done
+
+    echo "${total_bytes}|${total_files}|${count}|${computed}"
+}

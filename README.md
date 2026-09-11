@@ -560,29 +560,41 @@ Pending deletions after: 0
 
 **Fast listing and info (experimental):**
 ```bash
-# Same columns as `list`, but sizes come from Btrfs quota accounting (no file walk)
+# Compute exact sizes into a cache (run nightly via cron, or on demand)
+sudo ./src/server/manage_users.sh refresh-sizes            # all users, skips unchanged ones
+sudo ./src/server/manage_users.sh refresh-sizes <username> # one user
+sudo ./src/server/manage_users.sh refresh-sizes --force    # recompute everything
+
+# Same columns as `list`, reading the cache instead of walking files (instant)
 sudo ./src/server/manage_users.sh list-fast
 
-# Same as `info`, plus a per-snapshot Referenced/Exclusive breakdown
+# Same as `info`, reading the cache, with a per-snapshot breakdown
 sudo ./src/server/manage_users.sh info-fast <username>
 ```
 
-`list` and `info` walk every file in every snapshot to compute sizes, which can take
-many minutes for users with very large directory trees. The `-fast` variants read
-all sizes from a single `btrfs qgroup show` call instead, so they finish in well under
-a second regardless of file count. They are provided side by side with the original
-commands so results and timings can be compared before the originals are replaced.
+`list` and `info` walk every file in every snapshot and run `btrfs filesystem du` for
+every user on each invocation, which takes minutes on servers with large directory
+trees. The `-fast` variants read sizes from a cache in `/var/terminas/cache/` that
+`refresh-sizes` maintains:
 
-Differences to be aware of:
-- **Size(MB)** is the sum of *Exclusive* bytes over uploads + all snapshots (physical usage
-  as attributed by simple quotas). **Apparent** is the sum of *Referenced* bytes (each
-  subvolume counted as an independent copy).
-- Data written before quotas were enabled is not attributed to any qgroup and is not counted.
-- If Btrfs reports its accounting as inconsistent, a warning is printed. With simple
-  quotas this is expected whenever data existed before quotas were enabled: those extents
-  are never attributed and there is no rescan that can back-fill them. **Do not toggle
-  quotas off and on to "refresh"** — that resets attribution for all current data.
-- `info-fast` skips the upload file count, since counting requires a full tree walk.
+- Physical usage (`btrfs filesystem du`) and the logical size of `uploads/` are
+  recomputed only for users whose data changed (detected via the Btrfs generation of
+  the uploads subvolume and the set of snapshots), so a nightly run is cheap.
+- Each snapshot's logical size is computed **once**, because snapshots are immutable,
+  and dropped when the snapshot is deleted.
+- `list-fast` marks a row with `*` when the user's data changed since its sizes were
+  computed, and shows `n/a` for users with no cached size yet.
+- Connection times come from incremental journal reads (`journalctl --cursor-file`),
+  so only entries added since the previous run are read.
+
+To keep the cache fresh automatically:
+```bash
+echo "30 3 * * * /opt/terminas/src/server/manage_users.sh refresh-sizes >> /var/log/terminas-refresh-sizes.log 2>&1" | sudo crontab -
+```
+(append to the existing root crontab rather than replacing it if you already have entries).
+
+The `-fast` commands are provided side by side with `list`/`info` so results and timings
+can be compared before the originals are replaced.
 
 #### macOS Time Machine Support
 

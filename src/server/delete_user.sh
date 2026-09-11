@@ -237,6 +237,10 @@ if [ -d "/home/$USERNAME" ]; then
     fi
 fi
 
+# Remove cached size figures (maintained by manage_users.sh refresh-sizes)
+rm -f "/var/terminas/cache/sizes/$USERNAME" 2>/dev/null || true
+rm -rf "/var/terminas/cache/snapshots/$USERNAME" 2>/dev/null || true
+
 # Remove any runtime files
 rm -f "/var/run/terminas/last_$USERNAME" 2>/dev/null || true
 rm -f "/var/run/terminas/activity_$USERNAME" 2>/dev/null || true
