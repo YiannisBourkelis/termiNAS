@@ -93,6 +93,80 @@ if [ "$HOME_FS" != "btrfs" ]; then
 fi
 
 echo "✓ Btrfs filesystem detected on /home"
+
+# ---------------------------------------------------------------------------
+# noatime on /home
+# With the default relatime, reads cause writes: every directory listing or
+# file read (e.g. a daily rclone sync that transfers nothing) rewrites inode
+# metadata on this copy-on-write filesystem, bumps the uploads generation the
+# monitor watches, and duplicates metadata blocks that snapshots could share.
+# Nothing in termiNAS uses atime (snapshots and clients rely on mtime).
+# Applied only when it can be done safely; otherwise a warning is printed.
+# ---------------------------------------------------------------------------
+echo "Checking mount options on /home..."
+HOME_MOUNT_OPTS=$(findmnt -no OPTIONS --target /home 2>/dev/null || true)
+HOME_MOUNT_TARGET=$(findmnt -no TARGET --target /home 2>/dev/null || true)
+if echo ",$HOME_MOUNT_OPTS," | grep -q ',noatime,'; then
+    echo "  ✓ /home is mounted with noatime"
+elif [ "$HOME_MOUNT_TARGET" != "/home" ]; then
+    echo "  ⚠ /home is not a separate mount point (it belongs to the ${HOME_MOUNT_TARGET:-unknown} mount)."
+    echo "    Recommended: add 'noatime' to that filesystem's options in /etc/fstab and remount."
+else
+    if mount -o remount,noatime /home 2>/dev/null; then
+        echo "  ✓ Remounted /home with noatime"
+    else
+        echo "  ⚠ Could not remount /home with noatime; add it to /etc/fstab and remount manually"
+    fi
+
+    # Persist in /etc/fstab only when the /home entry is unambiguous
+    fstab_home_lines=$(awk '$1 !~ /^#/ && NF >= 4 && $2 == "/home" { n++ } END { print n + 0 }' /etc/fstab 2>/dev/null)
+    if [ "$fstab_home_lines" = "1" ]; then
+        if awk '$1 !~ /^#/ && NF >= 4 && $2 == "/home" && $4 ~ /(^|,)noatime(,|$)/ { found = 1 } END { exit !found }' /etc/fstab; then
+            echo "  ✓ /etc/fstab already has noatime for /home"
+        else
+            # Replace any explicit atime option with noatime, otherwise append it
+            awk '$1 !~ /^#/ && NF >= 4 && $2 == "/home" {
+                     n = split($4, o, ","); out = ""
+                     for (i = 1; i <= n; i++) {
+                         if (o[i] == "relatime" || o[i] == "strictatime" || o[i] == "atime" || o[i] == "noatime") continue
+                         out = out (out == "" ? "" : ",") o[i]
+                     }
+                     $4 = (out == "" ? "noatime" : out ",noatime")
+                 }
+                 { print }' OFS='\t' /etc/fstab > /etc/fstab.terminas.tmp
+            # Install only if the edited file verifies no worse than the original
+            # (pre-existing issues such as an unplugged 'nofail' disk must not block us,
+            # but anything our edit introduced must). Summary line: "N parse errors, N errors, N warnings"
+            fstab_verify_counts() {
+                local out
+                out=$(findmnt --verify --tab-file "$1" 2>&1)
+                if echo "$out" | grep -q '^Success'; then
+                    echo "0,0"
+                else
+                    echo "$out" | awk '/parse errors/ { print $1 + 0 "," $4 + 0 }'
+                fi
+            }
+            orig_counts=$(fstab_verify_counts /etc/fstab)
+            new_counts=$(fstab_verify_counts /etc/fstab.terminas.tmp)
+            if [ -n "$new_counts" ] && [ "${new_counts%%,*}" -le "${orig_counts%%,*}" ] && [ "${new_counts##*,}" -le "${orig_counts##*,}" ]; then
+                fstab_backup="/etc/fstab.terminas-$(date +%Y%m%d%H%M%S).bak"
+                cp -a /etc/fstab "$fstab_backup"
+                mv -f /etc/fstab.terminas.tmp /etc/fstab
+                # systemd generates mount units from fstab; pick up the new options
+                systemctl daemon-reload 2>/dev/null || true
+                echo "  ✓ Added noatime to the /home entry in /etc/fstab (backup: $fstab_backup)"
+            else
+                rm -f /etc/fstab.terminas.tmp
+                echo "  ⚠ Edited /etc/fstab did not pass verification (original: $orig_counts, edited: ${new_counts:-n/a} parse errors,errors)."
+                echo "    /etc/fstab was left unchanged; add 'noatime' to the /home entry manually."
+            fi
+        fi
+    elif [ "$fstab_home_lines" = "0" ]; then
+        echo "  ⚠ /home has no /etc/fstab entry (mounted another way); make noatime persistent yourself."
+    else
+        echo "  ⚠ Several /home entries in /etc/fstab; add 'noatime' to the active one manually."
+    fi
+fi
 echo ""
 
 # Enable Btrfs simple quotas (squotas) on /home filesystem

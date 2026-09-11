@@ -78,7 +78,7 @@ This software is provided "as is", without warranty of any kind, express or impl
 
 ### Server Requirements
 - **Debian 12 (Bookworm) or later** (requires Linux 6.x kernel for stable Btrfs support)
-- **Btrfs filesystem for /home** (required for snapshot functionality)
+- **Btrfs filesystem for /home** (required for snapshot functionality), ideally as its own mount point so `setup.sh` can enable `noatime` on it (reads no longer cause metadata writes; see the note under Snapshot Timing Configuration)
 - Root or sudo access for setup
 - OpenSSH server (installed automatically by setup script)
 
