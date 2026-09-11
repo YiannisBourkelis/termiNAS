@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-termiNAS is a versioned backup/NAS server for Debian 12+ that provides ransomware protection through real-time, immutable Btrfs copy-on-write snapshots. Clients upload via SFTP (chrooted, no shell) or optionally Samba/Time Machine; a server-side inotify monitor snapshots each user's `uploads/` into root-owned, read-only `versions/<YYYY-MM-DD_HH-MM-SS>/` snapshots that clients can read but never modify or delete.
+termiNAS is a versioned backup/NAS server for Debian 12+ that provides ransomware protection through real-time, immutable Btrfs copy-on-write snapshots. Clients upload via SFTP (chrooted, no shell) or optionally Samba/Time Machine; a server-side monitor (Btrfs generation polling) snapshots each user's `uploads/` into root-owned, read-only `versions/<YYYY-MM-DD_HH-MM-SS>/` snapshots that clients can read but never modify or delete.
 
 **Core principle: server-side immutability.** Snapshots are root-owned read-only Btrfs snapshots — even a fully compromised client cannot alter version history.
 
@@ -40,8 +40,8 @@ Scripts target Debian and mutate real system state (users, SSH config, Btrfs sub
 
 `src/server/setup.sh` does not just configure the system — it **generates the runtime scripts as embedded heredocs**:
 
-- `/var/terminas/scripts/terminas-monitor.sh` — written from an **unquoted** heredoc (`<<EOF`, ~line 537), so runtime variables must be escaped as `\$var`; unescaped `$var` expands at setup time. This is the #1 source of subtle bugs when editing.
-- `/var/terminas/scripts/terminas-cleanup.sh` — quoted heredoc (`<<'EOF'`, ~line 1123), no escaping needed.
+- `/var/terminas/scripts/terminas-monitor.sh` — quoted heredoc (`<<'EOF'`) with `__TERMINAS_VERSION__`/`__TERMINAS_COMMIT__`/`__GENERATED_AT__` placeholders substituted by `sed` afterwards, so write plain bash inside it (no `\$` escaping). Both generated scripts `source /var/terminas/scripts/common.sh`, which setup.sh copies from `src/server/common.sh`.
+- `/var/terminas/scripts/terminas-cleanup.sh` — quoted heredoc (`<<'EOF'`), no escaping needed.
 - Also generated: fail2ban jails/filters/actions (nftables), `/etc/samba/smb.conf` (with `--samba`), `terminas-monitor.service` systemd unit, `/etc/terminas-retention.conf`, logrotate config.
 
 **To change snapshot/monitor/quota-enforcement behavior, edit the heredocs in `setup.sh`**, then re-run `sudo ./setup.sh` on the server (it's designed to be idempotent — it greps existing config before appending; preserve that when adding features).
@@ -51,7 +51,8 @@ Scripts target Debian and mutate real system state (users, SSH config, Btrfs sub
 - `common.sh` — shared helpers sourced by the other scripts: `validate_password` (30+ chars, mixed case + digits), `parse_quota_value`/`format_quota_display` (GB/MB/bytes parsing), `get_backup_users`, Samba/Time Machine detection.
 - `create_user.sh <user> [-p pass] [--samba] [--timemachine] [--quota <GB|MB>]` — creates a chrooted SFTP-only user (nologin shell, member of `backupusers`), creates `uploads/` as a Btrfs subvolume, applies qgroup quota, writes quota metadata dotfiles.
 - `delete_user.sh` — removes user, subvolumes, snapshots, Samba config, quota metadata.
-- `manage_users.sh <command>` — ~20 admin commands (list, info, history, restore, cleanup, rebuild, set/show/remove-quota, enable/disable-samba[-versions], enable/disable-timemachine, change-password, force-clean, …). Adding a command = add function + update `usage()` + add case entry in the dispatch at the bottom + document in README.md.
+- `manage_users.sh <command>` — ~20 admin commands (list, info, refresh-sizes, history, restore, cleanup, rebuild, set/show/remove-quota, enable/disable-samba[-versions], enable/disable-timemachine, change-password, force-clean, …). Adding a command = add function + update `usage()` + add case entry in the dispatch at the bottom + document in README.md.
+- `list`/`info` never walk files: they read `/var/terminas/cache/` written by `refresh-sizes` (nightly cron from setup.sh; unchanged users skipped via uploads generation, immutable snapshots computed once) and incremental journald caches (`--cursor-file`, reused 15 min). Sizes must not come from qgroups: simple quotas only attribute data written after they were enabled, and toggling quotas resets that attribution.
 
 ### Data model (per user)
 
@@ -66,24 +67,22 @@ Scripts target Debian and mutate real system state (users, SSH config, Btrfs sub
 
 Chroot constraint: everything in the home directory must be root-owned or SSH refuses the chroot; never place `.bash*` files there.
 
-### Snapshot monitor
+### Snapshot monitor (Btrfs generation polling — no inotify)
 
-One global `inotifywait -m -r /home` (excluding `versions/`) watches `close_write`/`moved_to`/`delete` events. Snapshots are taken 60s after the last file closes (`TERMINAS_INACTIVITY_WINDOW`), with periodic snapshots every 30 min (`TERMINAS_SNAPSHOT_INTERVAL`) that exclude still-open files. Only complete files are captured — never use the `create` event.
-
-**Known limitation (documented, intentionally accepted):** the global inotify watches hold kernel references to deleted inodes, so deleting users/snapshots leaves Btrfs "pending deletions" that consume space until the monitor restarts (`manage_users.sh force-clean`). Per-user-watcher and signal-based alternatives are designed but deliberately not implemented — see `docs/ARCHITECTURE_PER_USER_INOTIFY.md` before "fixing" this.
+Every `TERMINAS_POLL_INTERVAL` (10s) the monitor runs one `btrfs subvolume list -c /home` and, per user, compares the uploads subvolume's `gen` with the newest snapshot's `cgen` (creation generation). `gen > cgen` means uncaptured changes; a snapshot is taken once `gen` has been stable for `TERMINAS_INACTIVITY_WINDOW` (60s) or after `TERMINAS_SNAPSHOT_INTERVAL` (30 min) of continuous activity, excluding files some process holds open for writing (found via `/proc/*/fd`, not `lsof`). Cost is independent of file/directory count. Do not reintroduce recursive inotify: a user with ~500k directories exhausted the watch limit and silently killed the service in Sep 2026 (`docs/ARCHITECTURE_PER_USER_INOTIFY.md` has the history). Pending Btrfs deletions are now reclaimed on their own.
 
 ### Quota system (hybrid)
 
 Uses Btrfs **simple quotas** (`btrfs quota enable --simple /home`) — never full qgroup accounting, which causes kernel-level write stalls. Two layers:
 
 1. **Hard limit**: level-0 qgroup on the `uploads` subvolume blocks writes at the filesystem level.
-2. **Hybrid total check**: after each snapshot the monitor sums uploads + all snapshots (exclusive bytes); if over the limit it sets the uploads qgroup limit to 1 byte and writes `.terminas-quota-exceeded`. Unblocked automatically on delete events or by the daily cleanup recheck.
+2. **Hybrid total check**: after each snapshot the monitor sums uploads + all snapshots (exclusive bytes); if over the limit it sets the uploads qgroup limit to 1 byte and writes `.terminas-quota-exceeded`. Unblocked automatically when the blocked user's data changes again (deletions) or by the daily cleanup recheck.
 
-Note: in squota mode `btrfs quota rescan` is invalid — toggle quotas off/on to refresh accounting. Details in `docs/QUOTA_ARCHITECTURE.md`.
+Note: in squota mode `btrfs quota rescan` is invalid, and **never toggle quotas off/on to "refresh"** — extents that exist when squota is enabled are never attributed, so a toggle zeroes the accounting for all current data (this is why Btrfs reports the accounting as "inconsistent" on servers with pre-quota data). Details in `docs/QUOTA_ARCHITECTURE.md`.
 
 ### Retention
 
-Daily cron (3 AM) runs `terminas-cleanup.sh`: Grandfather-Father-Son by default (7 daily / 4 weekly / 6 monthly) or simple age-based, configured in `/etc/terminas-retention.conf` with per-user overrides (`<user>_KEEP_DAILY=…`; dashes in usernames become underscores in variable names).
+Daily cron (3 AM) runs `terminas-cleanup.sh`, and 03:30 runs `manage_users.sh refresh-sizes`: Grandfather-Father-Son by default (7 daily / 4 weekly / 6 monthly) or simple age-based, configured in `/etc/terminas-retention.conf` with per-user overrides (`<user>_KEEP_DAILY=…`; dashes in usernames become underscores in variable names).
 
 ### Clients (`src/client/`)
 

@@ -47,11 +47,9 @@ https://github.com/YiannisBourkelis/terminas
 Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
-    list                    List all backup users with disk usage and connection status
-    list-fast [--refresh]   Same as list, reading cached sizes and connection times (instant; experimental)
-    info <username>         Show detailed information including connection activity
-    info-fast <username> [--refresh]  Same as info, reading cached data, with per-snapshot breakdown (experimental)
-    refresh-sizes [username] [--force]  Compute exact sizes into the cache used by list-fast/info-fast
+    list [--refresh]        List all backup users with disk usage and connection status
+    info <username> [--refresh]  Show detailed information including connection activity
+    refresh-sizes [username] [--force]  Compute exact sizes into the cache used by list/info (run nightly)
     history <username>      Show snapshot history for a user
     search <pattern>        Search for files in latest snapshots
     inactive [days]         List users with no recent uploads (default: 30 days)
@@ -100,6 +98,9 @@ Examples:
     $SCRIPT_NAME disable-timemachine testuser
 
 Notes:
+    - list/info read sizes cached by refresh-sizes (installed as a nightly cron job by setup.sh);
+      rows marked * changed since their sizes were computed. Connection times are read from the
+      journal incrementally and reused for 15 minutes; --refresh forces a fresh read.
     - The cleanup command removes old Btrfs snapshots and keeps only the latest
     - Delete command removes the user and ALL their data permanently
     - Restore command copies files to specified destination (destination must not exist)
@@ -401,23 +402,6 @@ get_actual_size() {
     fi
 }
 
-# Calculate apparent size (sum of all file sizes, counting hardlinks multiple times) in MB with decimals
-get_apparent_size() {
-    local path="$1"
-    if [ -d "$path" ]; then
-        # Use find -printf to get file sizes without spawning a separate process per file
-        # This is MUCH faster than -exec stat for directories with many files
-        local mb=$(find "$path" -type f -printf '%s\n' 2>/dev/null | awk '{sum+=$1} END {printf "%.2f", sum/1024/1024}')
-        if [ -z "$mb" ] || [ "$mb" = "0.00" ]; then
-            echo "0.00"
-        else
-            echo "$mb"
-        fi
-    else
-        echo "0.00"
-    fi
-}
-
 # Get last backup date for a user
 # Parse snapshot directory name to extract timestamp
 # Btrfs snapshots preserve the original subvolume's metadata (birth/modify times),
@@ -489,52 +473,6 @@ get_snapshot_info() {
         echo "$snapshot|$epoch|$formatted"
     else
         echo "||Never"
-    fi
-}
-
-get_last_backup_date() {
-    local user="$1"
-    local info=$(get_snapshot_info "$user" "newest")
-    local epoch=$(echo "$info" | cut -d'|' -f2)
-    local formatted=$(echo "$info" | cut -d'|' -f3)
-    
-    if [ -n "$epoch" ] && [ "$epoch" -gt 0 ] 2>/dev/null; then
-        # Reformat to match expected output format (without seconds)
-        local short_date=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || date -r "$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$formatted")
-        echo "$short_date|$epoch"
-    else
-        echo "Never|0"
-    fi
-}
-
-# Calculate total logical size of all snapshots for a user (in MB)
-# Uses efficient single-pass find to avoid iterating through each snapshot separately
-# Args: $1 = versions_dir path
-# Returns: Size in MB (e.g., "1234.56")
-get_snapshots_logical_size() {
-    local versions_dir="$1"
-    
-    if [ ! -d "$versions_dir" ]; then
-        echo "0.00"
-        return
-    fi
-    
-    local snapshot_count=$(find "$versions_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-    
-    if [ $snapshot_count -eq 0 ]; then
-        echo "0.00"
-        return
-    fi
-    
-    # Calculate total logical size of all snapshots in one pass
-    # Much faster than iterating through each snapshot individually
-    local size=$(find "$versions_dir" -type f -printf '%s\n' 2>/dev/null | awk '{sum+=$1} END {printf "%.2f", sum/1024/1024}')
-    
-    # Handle empty result
-    if [ -z "$size" ] || [ "$size" = "" ]; then
-        echo "0.00"
-    else
-        echo "$size"
     fi
 }
 
@@ -716,7 +654,7 @@ journal_read_incremental() {
     return 0
 }
 
-# Incremental SSH login cache. Reads the journal with native timestamps and
+# SSH login cache (incremental). Reads the journal with native timestamps and
 # native filtering, and keeps a cursor so each run only reads entries added
 # since the previous run (a full 90-day read costs ~13s on a busy server; the
 # incremental read is nearly free). Matches every "Accepted <method> for"
@@ -787,7 +725,7 @@ build_connection_cache_fast() {
     mv -f "$state.tmp" "$state"
 }
 
-# Incremental Samba activity cache: one pass for all users (the original
+# Samba activity cache (incremental): one pass for all users (the original
 # scans the journal once per Samba user), with a journal cursor like the SSH
 # cache. Audit payload format: user|ip|machine|operation|... (last field).
 # When /var/log/samba/audit.log is in use it is scanned in a single pass
@@ -878,85 +816,6 @@ get_last_connection() {
     else
         echo "Never|0"
     fi
-}
-
-# Build Samba connection cache
-build_samba_connection_cache() {
-    declare -gA SAMBA_CONNECTION_CACHE
-    
-    # Check Samba VFS audit log for SMB file operations
-    # The audit log format is: timestamp hostname username|ip|machine|operation
-    # Example: Oct 12 14:23:45 debmain sambatest|192.168.1.100|myrsini-pc|connect
-    
-    local audit_log="/var/log/samba/audit.log"
-    local use_journald=false
-    
-    # Prefer journald if audit.log doesn't exist or is empty
-    if [ ! -s "$audit_log" ] && command -v journalctl &>/dev/null; then
-        # File doesn't exist or is empty, use journald
-        use_journald=true
-    elif [ ! -s "$audit_log" ]; then
-        # No audit source available (no file and no journalctl)
-        return
-    fi
-    
-    local users=$(get_backup_users)
-    while IFS= read -r user; do
-        if [ -z "$user" ]; then
-            continue
-        fi
-        
-        # Only check users with Samba enabled
-        if ! has_samba_enabled "$user"; then
-            continue
-        fi
-        
-        local latest_line=""
-        
-        if [ "$use_journald" = true ]; then
-            # Parse from journald (smbd logs with audit prefix)
-            # Format: Oct 12 01:21:40 debmain smbd_audit[536369]: sambatest|94.69.215.1|myrsini-pc|close|ok|...
-            # Use SYSLOG_IDENTIFIER=smbd_audit to get VFS audit logs
-            latest_line=$(journalctl --since "30 days ago" SYSLOG_IDENTIFIER=smbd_audit --no-pager 2>/dev/null | \
-                grep ": $user|" | \
-                grep -E "connect|write|pwrite|close" | \
-                tail -1)
-        else
-            # Parse from audit.log file
-            # Look for connect, write, pwrite operations (indicates active usage)
-            latest_line=$(grep "^[A-Za-z].*$user|" "$audit_log" 2>/dev/null | \
-                grep -E "connect|write|pwrite|close" | \
-                tail -1)
-        fi
-        
-        if [ -n "$latest_line" ]; then
-            # Extract timestamp
-            # Journald format: "Oct 12 01:21:40 hostname smbd_audit[...]: ..."
-            # We need: "Oct 12 01:21:40" (first 3 fields, but field 3 is the time)
-            local month=$(echo "$latest_line" | awk '{print $1}')
-            local day=$(echo "$latest_line" | awk '{print $2}')
-            local time=$(echo "$latest_line" | awk '{print $3}')
-            local timestamp="$month $day $time"
-            
-            if [ -n "$timestamp" ]; then
-                # Convert to epoch - GNU date format
-                # Note: Log timestamps don't include year, so we need to handle year rollover
-                local current_year=$(date +%Y)
-                local current_epoch=$(date +%s)
-                local epoch=$(date -d "$timestamp $current_year" +%s 2>/dev/null || echo 0)
-                
-                # If parsed date is in the future, it's from last year
-                if [ "$epoch" -gt "$current_epoch" ]; then
-                    epoch=$((epoch - 31536000))  # Subtract one year (365 days in seconds)
-                fi
-                
-                if [ "$epoch" -gt 0 ]; then
-                    local formatted=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
-                    SAMBA_CONNECTION_CACHE[$user]="$formatted|$epoch"
-                fi
-            fi
-        fi
-    done <<< "$users"
 }
 
 # Get last Samba connection time for a user from cache
@@ -1821,546 +1680,13 @@ show_quota_user() {
 }
 
 # List all backup users with their disk usage
-list_users() {
-    local users=$(get_backup_users)
-    if [ -z "$users" ]; then
-        echo "No backup users found."
-        return
-    fi
-    
-    # Check if any user has Samba enabled (determines if we show SMB column)
-    local any_samba=false
-    while IFS= read -r user; do
-        if [ -n "$user" ] && has_samba_enabled "$user"; then
-            any_samba=true
-            break
-        fi
-    done <<< "$users"
-    
-    # Display header immediately before doing heavy processing
-    echo "Backup Users:"
-    if [ "$any_samba" = true ]; then
-        echo "======================================================================================================================================================================================================"
-        printf "%-16s %12s %12s %6s %12s %23s %20s %20s %10s\n" "Username" "Size(MB)" "Apparent" "Snaps" "Protocol" "Last Snapshot" "Last SFTP" "Last SMB" "Status"
-        echo "------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-    else
-        echo "======================================================================================================================================"
-        printf "%-16s %12s %12s %6s %12s %23s %23s %10s\n" "Username" "Size(MB)" "Apparent" "Snaps" "Protocol" "Last Snapshot" "Last SFTP" "Status"
-        echo "--------------------------------------------------------------------------------------------------------------------------------------"
-    fi
-    
-    # Build connection caches once for all users (performance optimization)
-    build_connection_cache
-    if [ "$any_samba" = true ]; then
-        build_samba_connection_cache
-    fi
-    
-    local total_actual="0.00"
-    local total_apparent="0.00"
-    local total_users=0
-    local now=$(date +%s)
-    local warn_threshold=$((15 * 86400))  # 15 days in seconds
-    
-    while IFS= read -r user; do
-        if [ -z "$user" ]; then
-            continue
-        fi
-        
-        local home_dir="/home/$user"
-        if [ ! -d "$home_dir" ]; then
-            continue
-        fi
-        
-        # Calculate sizes using Btrfs-aware method
-        local actual_size="0.00"
-        local apparent_size="0.00"
-        
-        # Try to get actual physical usage from btrfs filesystem du
-        if command -v btrfs &>/dev/null; then
-            local btrfs_output=$(btrfs filesystem du -s "$home_dir" 2>/dev/null)
-            if [ -n "$btrfs_output" ]; then
-                local data_line=$(echo "$btrfs_output" | tail -1)
-                local exclusive_raw=$(echo "$data_line" | awk '{print $2}')
-                local shared_raw=$(echo "$data_line" | awk '{print $3}')
-                
-                # Convert to MB
-                local exclusive_mb=$(echo "$exclusive_raw" | awk '{
-                    size=$1;
-                    if (size ~ /GiB/) { gsub(/[^0-9.]/, "", size); print size * 1024 }
-                    else if (size ~ /MiB/) { gsub(/[^0-9.]/, "", size); print size }
-                    else if (size ~ /KiB/) { gsub(/[^0-9.]/, "", size); print size / 1024 }
-                    else if (size ~ /B$/) { gsub(/[^0-9.]/, "", size); print size / 1024 / 1024 }
-                    else { print size / 1024 / 1024 }
-                }')
-                
-                local shared_mb=$(echo "$shared_raw" | awk '{
-                    size=$1;
-                    if (size ~ /GiB/) { gsub(/[^0-9.]/, "", size); print size * 1024 }
-                    else if (size ~ /MiB/) { gsub(/[^0-9.]/, "", size); print size }
-                    else if (size ~ /KiB/) { gsub(/[^0-9.]/, "", size); print size / 1024 }
-                    else if (size ~ /B$/) { gsub(/[^0-9.]/, "", size); print size / 1024 / 1024 }
-                    else if (size == "-") { print 0 }
-                    else { print size / 1024 / 1024 }
-                }')
-                
-                actual_size=$(echo "scale=2; ($exclusive_mb + $shared_mb) / 1" | bc)
-            fi
-        fi
-        
-        # Fallback to du if btrfs command failed
-        if [ "$actual_size" = "0.00" ]; then
-            actual_size=$(get_actual_size "$home_dir")
-        fi
-        
-        # Calculate logical size (sum of all files in uploads + all snapshots)
-        local uploads_logical=$(get_apparent_size "$home_dir/uploads")
-        
-        # Count snapshots and calculate logical size using shared function
-        local snapshot_count=0
-        local snapshots_logical="0.00"
-        if [ -d "$home_dir/versions" ]; then
-            snapshot_count=$(find "$home_dir/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-            snapshots_logical=$(get_snapshots_logical_size "$home_dir/versions")
-        fi
-        
-        apparent_size=$(echo "scale=2; ($uploads_logical + $snapshots_logical) / 1" | bc)
-        
-        # Get last backup date
-        local backup_info=$(get_last_backup_date "$user")
-        local last_date=$(echo "$backup_info" | cut -d'|' -f1)
-        local last_epoch=$(echo "$backup_info" | cut -d'|' -f2)
-        
-        # Get last connection time
-        local conn_info=$(get_last_connection "$user")
-        local last_conn=$(echo "$conn_info" | cut -d'|' -f1)
-        local conn_epoch=$(echo "$conn_info" | cut -d'|' -f2)
-        
-        # Determine status with improved logic
-        local status="OK"
-        local status_color=""
-        
-        if [ "$last_date" = "Never" ] && [ "$last_conn" = "Never" ]; then
-            # No backup and no connection - never used
-            status="⚠ NEVER USED"
-            status_color="\033[1;33m"  # Yellow
-        elif [ "$last_date" = "Never" ] && [ "$last_conn" != "Never" ]; then
-            # Connected but no snapshot yet (new user or files still uploading)
-            local conn_days=$(( (now - conn_epoch) / 86400 ))
-            status="⚠ No snapshot (conn: ${conn_days}d)"
-            status_color="\033[1;33m"  # Yellow
-        elif [ "$last_epoch" -gt 0 ]; then
-            local backup_days=$(( (now - last_epoch) / 86400 ))
-            
-            # Check if connection is more recent than backup (no changes scenario)
-            if [ "$conn_epoch" -gt "$last_epoch" ]; then
-                # Connected after last backup = backup running but no changes
-                local conn_days=$(( (now - conn_epoch) / 86400 ))
-                if [ $backup_days -gt 15 ]; then
-                    status="✓ No changes (${backup_days}d)"
-                    status_color="\033[0;32m"  # Green (this is good!)
-                else
-                    status="✓ OK (${backup_days}d)"
-                    status_color="\033[0;32m"  # Green
-                fi
-            else
-                # Last backup more recent than connection (or no connection logged)
-                if [ $backup_days -gt 15 ]; then
-                    status="⚠ ${backup_days}d ago"
-                    status_color="\033[1;33m"  # Yellow
-                else
-                    status="✓ OK (${backup_days}d)"
-                    status_color="\033[0;32m"  # Green
-                fi
-            fi
-        fi
-        
-        # Format dates for display (keep full date/time)
-        local display_backup="$last_date"
-        local display_sftp="$last_conn"
-        
-        # Get Samba connection info if enabled
-        local display_smb="N/A"
-        if [ "$any_samba" = true ]; then
-            if has_samba_enabled "$user"; then
-                local smb_info=$(get_last_samba_connection "$user")
-                display_smb=$(echo "$smb_info" | cut -d'|' -f1)
-            fi
-        fi
-        
-        # Determine protocol support
-        local protocol="SFTP"
-        if has_samba_enabled "$user"; then
-            protocol="SMB+SFTP"
-            # Add markers for additional features
-            local has_versions="no"
-            local has_tm="no"
-            if has_samba_versions_enabled "$user" 2>/dev/null; then
-                has_versions="yes"
-            fi
-            if has_timemachine_enabled "$user" 2>/dev/null; then
-                has_tm="yes"
-            fi
-            
-            if [ "$has_versions" = "yes" ] && [ "$has_tm" = "yes" ]; then
-                protocol="SMB*TM+SFTP"
-            elif [ "$has_versions" = "yes" ]; then
-                protocol="SMB*+SFTP"
-            elif [ "$has_tm" = "yes" ]; then
-                protocol="SMBTM+SFTP"
-            fi
-        fi
-        
-        # Print with color - adjust format based on whether Samba column is shown
-        if [ "$any_samba" = true ]; then
-            if [ -n "$status_color" ] && [ "$status" != "✓"* ]; then
-                printf "%-16s %12s %12s %6s %12s %23s %20s %20s ${status_color}%12s\033[0m\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$display_backup" "$display_sftp" "$display_smb" "$status"
-            else
-                printf "%-16s %12s %12s %6s %12s %23s %20s %20s %12s\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$display_backup" "$display_sftp" "$display_smb" "$status"
-            fi
-        else
-            if [ -n "$status_color" ] && [ "$status" != "✓"* ]; then
-                printf "%-16s %12s %12s %6s %12s %23s %23s ${status_color}%12s\033[0m\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$display_backup" "$display_sftp" "$status"
-            else
-                printf "%-16s %12s %12s %6s %12s %23s %23s %12s\n" "$user" "$actual_size" "$apparent_size" "$snapshot_count" "$protocol" "$display_backup" "$display_sftp" "$status"
-            fi
-        fi
-        
-        # Sum up totals using bc for decimal arithmetic
-        total_actual=$(echo "$total_actual + $actual_size" | bc)
-        total_apparent=$(echo "$total_apparent + $apparent_size" | bc)
-        total_users=$((total_users + 1))
-    done <<< "$users"
-    
-    # Print footer with appropriate line length
-    if [ "$any_samba" = true ]; then
-        echo "------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-        printf "%-16s %12s %12s %6s %12s\n" "Total: $total_users" "$total_actual" "$total_apparent" "" ""
-    else
-        echo "--------------------------------------------------------------------------------------------------------------------------------------"
-        printf "%-16s %12s %12s %6s %12s\n" "Total: $total_users" "$total_actual" "$total_apparent" "" ""
-    fi
-    
-    echo ""
-    echo "Note: Size(MB) shows physical disk usage with Btrfs deduplication"
-    echo "      Apparent shows logical size (sum of all files as if independent copies)"
-    echo "      The difference shows space saved by Btrfs CoW snapshots"
-    echo "      Protocol shows available access methods (SFTP or SMB+SFTP)"
-    echo "      SMB* = Read-only versions access enabled (disable with 'disable-samba-versions <user>')"
-    echo "      Last Snapshot shows when the most recent snapshot was created"
-    echo "      Last SFTP shows most recent SSH/SFTP authentication"
-    if [ "$any_samba" = true ]; then
-        echo "      Last SMB shows most recent Samba/SMB connection (N/A if Samba not enabled for user)"
-    fi
-    echo "      Status meanings:"
-    echo "        ✓ OK           = Recent snapshot or connection with no changes (good!)"
-    echo "        ✓ No changes   = Backup job running but no file changes detected"
-    echo "        ⚠ NEVER USED   = User never connected"
-    echo "        ⚠ No snapshot  = Connected but no snapshot created yet"
-    echo "        ⚠ Xd ago       = Last snapshot more than 15 days old"
-}
-
-# Show detailed information about a specific user
-info_user() {
-    local username="$1"
-    
-    if [ -z "$username" ]; then
-        echo "Error: Username is required" >&2
-        usage
-        exit 1
-    fi
-    
-    # Check if user exists
-    if ! id "$username" &>/dev/null; then
-        echo "Error: User '$username' does not exist" >&2
-        exit 1
-    fi
-    
-    local home_dir="/home/$username"
-    if [ ! -d "$home_dir" ]; then
-        echo "Error: Home directory not found for user '$username'" >&2
-        exit 1
-    fi
-    
-    echo "User Information: $username"
-    echo "========================================"
-    
-    # User details
-    echo "UID: $(id -u "$username")"
-    echo "Groups: $(groups "$username" | cut -d: -f2)"
-    echo "Home: $home_dir"
-    echo ""
-    
-    # Build connection caches for lookups
-    build_connection_cache
-    build_samba_connection_cache
-    
-    # Connection activity
-    local conn_info=$(get_last_connection "$username")
-    local last_conn=$(echo "$conn_info" | cut -d'|' -f1)
-    local conn_epoch=$(echo "$conn_info" | cut -d'|' -f2)
-    
-    # Get SMB connection info if Samba is enabled
-    local samba_conn="Never"
-    local samba_epoch=0
-    if has_samba_enabled "$username"; then
-        local samba_info="${SAMBA_CONNECTION_CACHE[$username]}"
-        if [ -n "$samba_info" ]; then
-            samba_conn=$(echo "$samba_info" | cut -d'|' -f1)
-            samba_epoch=$(echo "$samba_info" | cut -d'|' -f2)
-        fi
-    fi
-    
-    echo "Connection Activity:"
-    
-    # Display SFTP/SSH connection
-    if [ "$last_conn" != "Never" ] && [ "$conn_epoch" -gt 0 ]; then
-        local now=$(date +%s)
-        local days_ago=$(( (now - conn_epoch) / 86400 ))
-        local hours_ago=$(( (now - conn_epoch) / 3600 ))
-        
-        echo "  Last SFTP:       $last_conn"
-        if [ $hours_ago -lt 24 ]; then
-            echo "                   ${hours_ago} hours ago"
-        else
-            echo "                   ${days_ago} days ago"
-        fi
-    else
-        echo "  Last SFTP:       Never"
-    fi
-    
-    # Display SMB connection if Samba is enabled
-    if has_samba_enabled "$username"; then
-        if [ "$samba_conn" != "Never" ] && [ "$samba_epoch" -gt 0 ]; then
-            local now=$(date +%s)
-            local days_ago=$(( (now - samba_epoch) / 86400 ))
-            local hours_ago=$(( (now - samba_epoch) / 3600 ))
-            
-            echo "  Last SMB:        $samba_conn"
-            if [ $hours_ago -lt 24 ]; then
-                echo "                   ${hours_ago} hours ago"
-            else
-                echo "                   ${days_ago} days ago"
-            fi
-        else
-            echo "  Last SMB:        Never"
-        fi
-    fi
-    echo ""
-    
-    # Disk usage - check if directories have actual files first
-    local has_files=0
-    if [ -n "$(find "$home_dir/uploads" -type f 2>/dev/null | head -1)" ] || \
-       [ -n "$(find "$home_dir/versions" -type f 2>/dev/null | head -1)" ]; then
-        has_files=1
-    fi
-    
-    if [ "$has_files" -eq 1 ]; then
-        # Use btrfs filesystem du for accurate shared/exclusive breakdown
-        local versions_dir="$home_dir/versions"
-        local snapshot_count=0
-        local total_logical_size="0.00"
-        local uploads_logical=$(get_apparent_size "$home_dir/uploads")
-        
-        if [ -d "$versions_dir" ]; then
-            snapshot_count=$(find "$versions_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-            # Use shared function for calculating snapshot sizes
-            total_logical_size=$(get_snapshots_logical_size "$versions_dir")
-        fi
-        
-        # Calculate logical size (what it would be without Btrfs CoW)
-        local total_logical=$(echo "$uploads_logical + $total_logical_size" | bc)
-        
-        # Try to get actual physical usage using btrfs filesystem du
-        local physical_usage=""
-        local space_saved=""
-        local efficiency_pct="0"
-        local exclusive_size=""
-        local shared_size=""
-        
-        if command -v btrfs &>/dev/null; then
-            # Get exclusive + shared bytes for the home directory
-            local btrfs_output=$(btrfs filesystem du -s "$home_dir" 2>/dev/null)
-            if [ -n "$btrfs_output" ]; then
-                # Parse: "Total   Exclusive  Set shared  Filename"
-                # Extract Exclusive and Set shared columns
-                local data_line=$(echo "$btrfs_output" | tail -1)
-                
-                # Extract exclusive size (2nd column)
-                local exclusive_raw=$(echo "$data_line" | awk '{print $2}')
-                # Extract set shared size (3rd column)
-                local shared_raw=$(echo "$data_line" | awk '{print $3}')
-                
-                # Convert to MB
-                exclusive_size=$(echo "$exclusive_raw" | awk '{
-                    size=$1;
-                    if (size ~ /GiB/) { gsub(/[^0-9.]/, "", size); print size * 1024 }
-                    else if (size ~ /MiB/) { gsub(/[^0-9.]/, "", size); print size }
-                    else if (size ~ /KiB/) { gsub(/[^0-9.]/, "", size); print size / 1024 }
-                    else if (size ~ /B$/) { gsub(/[^0-9.]/, "", size); print size / 1024 / 1024 }
-                    else { print size / 1024 / 1024 }
-                }')
-                
-                shared_size=$(echo "$shared_raw" | awk '{
-                    size=$1;
-                    if (size ~ /GiB/) { gsub(/[^0-9.]/, "", size); print size * 1024 }
-                    else if (size ~ /MiB/) { gsub(/[^0-9.]/, "", size); print size }
-                    else if (size ~ /KiB/) { gsub(/[^0-9.]/, "", size); print size / 1024 }
-                    else if (size ~ /B$/) { gsub(/[^0-9.]/, "", size); print size / 1024 / 1024 }
-                    else if (size == "-") { print 0 }
-                    else { print size / 1024 / 1024 }
-                }')
-                
-                # Physical usage = exclusive + shared (but shared is counted once across all subvolumes)
-                # The real physical storage is approximately: shared_size + exclusive_size
-                local physical_mb=$(echo "$shared_size + $exclusive_size" | bc)
-                
-                space_saved=$(echo "$total_logical - $physical_mb" | bc)
-                physical_usage="${physical_mb} MB"
-                
-                if [ $(echo "$total_logical > 0" | bc) -eq 1 ]; then
-                    efficiency_pct=$(echo "scale=1; ($space_saved / $total_logical) * 100" | bc)
-                fi
-            fi
-        fi
-        
-        # Fallback to du-based calculation if btrfs filesystem du failed
-        if [ -z "$physical_usage" ]; then
-            local actual_size=$(get_actual_size "$home_dir")
-            space_saved=$(echo "$total_logical - $actual_size" | bc)
-            physical_usage="${actual_size} MB"
-            
-            if [ $(echo "$total_logical > 0" | bc) -eq 1 ]; then
-                efficiency_pct=$(echo "scale=1; ($space_saved / $total_logical) * 100" | bc)
-            fi
-        fi
-        
-        echo "Disk Usage:"
-        echo "  Uploads:            ${uploads_logical} MB (current files)"
-        echo "  Snapshots (${snapshot_count}):       ${total_logical_size} MB (logical size)"
-        echo "  Total logical:      ${total_logical} MB (sum of all files)"
-        echo "  Physical usage:     ${physical_usage} (with Btrfs deduplication)"
-        echo "  Space saved:        ${space_saved} MB (${efficiency_pct}% efficient)"
-    else
-        echo "Disk Usage:"
-        echo "  No files uploaded yet (0.00 MB)"
-    fi
-    echo ""
-    
-    # Quota information
-    local quota_info=$(get_user_quota "$username")
-    if [ -n "$quota_info" ]; then
-        local used_bytes=$(echo "$quota_info" | cut -d'|' -f1)
-        local limit_bytes=$(echo "$quota_info" | cut -d'|' -f2)
-        
-        local used_gb=$(echo "scale=2; $used_bytes / 1024 / 1024 / 1024" | bc)
-        
-        if [ "$limit_bytes" = "0" ]; then
-            echo "Storage Quota: Unlimited (${used_gb}GB used)"
-        else
-            local limit_gb=$(echo "scale=2; $limit_bytes / 1024 / 1024 / 1024" | bc)
-            local usage_pct=$(echo "scale=1; ($used_bytes / $limit_bytes) * 100" | bc)
-            local available_bytes=$((limit_bytes - used_bytes))
-            local available_gb=$(echo "scale=2; $available_bytes / 1024 / 1024 / 1024" | bc)
-            
-            echo "Storage Quota: ${used_gb}GB / ${limit_gb}GB (${usage_pct}% used, ${available_gb}GB available)"
-            
-            if [ $(echo "$usage_pct > 90" | bc) -eq 1 ]; then
-                echo "  ⚠ WARNING: Quota usage above 90%"
-            fi
-        fi
-    else
-        echo "Storage Quota: Unlimited (no quota set)"
-    fi
-    echo ""
-    
-    # Snapshot statistics
-    local versions_dir="$home_dir/versions"
-    if [ -d "$versions_dir" ]; then
-        local snapshot_count=$(find "$versions_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-        echo "Snapshots: $snapshot_count"
-        
-        if [ "$snapshot_count" -gt 0 ]; then
-            # Use shared get_snapshot_info function for consistent birth time handling
-            local oldest_info=$(get_snapshot_info "$versions_dir" "oldest")
-            local oldest=$(echo "$oldest_info" | cut -d'|' -f1)
-            local oldest_date=$(echo "$oldest_info" | cut -d'|' -f3)
-            
-            local newest_info=$(get_snapshot_info "$versions_dir" "newest")
-            local newest=$(echo "$newest_info" | cut -d'|' -f1)
-            local newest_date=$(echo "$newest_info" | cut -d'|' -f3)
-            
-            if [ -n "$oldest" ] && [ "$oldest_date" != "Never" ]; then
-                echo "  Oldest:  $(basename "$oldest")"
-                echo "           Created: $oldest_date"
-            fi
-            
-            if [ -n "$newest" ] && [ "$newest_date" != "Never" ]; then
-                echo "  Newest:  $(basename "$newest")"
-                echo "           Created: $newest_date"
-            fi
-        fi
-    else
-        echo "Snapshots: 0"
-    fi
-    echo ""
-    
-    # Upload activity
-    if [ -d "$home_dir/uploads" ]; then
-        local file_count=$(find "$home_dir/uploads" -type f 2>/dev/null | wc -l)
-        echo "Current uploads: $file_count files"
-        
-        if [ "$file_count" -gt 0 ]; then
-            local latest_file=$(find "$home_dir/uploads" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
-            if [ -n "$latest_file" ]; then
-                local latest_date=$(stat -c %y "$latest_file" 2>/dev/null | cut -d. -f1 || stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$latest_file" 2>/dev/null)
-                echo "  Last upload: $latest_date"
-            fi
-        fi
-    else
-        echo "Current uploads: 0 files"
-    fi
-    echo ""
-    
-    # Retention policy (if custom)
-    if [ -f /etc/terminas-retention.conf ]; then
-        source /etc/terminas-retention.conf
-        local has_custom=false
-        
-        # Replace dashes with underscores for valid bash variable names
-        local safe_username="${username//-/_}"
-        
-        local user_daily_var="${safe_username}_KEEP_DAILY"
-        local user_weekly_var="${safe_username}_KEEP_WEEKLY"
-        local user_monthly_var="${safe_username}_KEEP_MONTHLY"
-        local user_retention_var="${safe_username}_RETENTION_DAYS"
-        local user_advanced_var="${safe_username}_ENABLE_ADVANCED_RETENTION"
-        
-        if [ -n "${!user_daily_var}" ] || [ -n "${!user_weekly_var}" ] || [ -n "${!user_monthly_var}" ] || \
-           [ -n "${!user_retention_var}" ] || [ -n "${!user_advanced_var}" ]; then
-            has_custom=true
-        fi
-        
-        if [ "$has_custom" = true ]; then
-            echo "Retention Policy: Custom"
-            [ -n "${!user_advanced_var}" ] && echo "  Advanced: ${!user_advanced_var}"
-            [ -n "${!user_daily_var}" ] && echo "  Keep daily: ${!user_daily_var}"
-            [ -n "${!user_weekly_var}" ] && echo "  Keep weekly: ${!user_weekly_var}"
-            [ -n "${!user_monthly_var}" ] && echo "  Keep monthly: ${!user_monthly_var}"
-            [ -n "${!user_retention_var}" ] && echo "  Retention days: ${!user_retention_var}"
-        else
-            echo "Retention Policy: Default (from /etc/terminas-retention.conf)"
-        fi
-    fi
-}
-
 # ---------------------------------------------------------------------------
-# Fast variants (list-fast / info-fast)
+# list / info
 # ---------------------------------------------------------------------------
-# These read exact sizes from the cache maintained by `refresh-sizes` (see the
-# size-cache helpers in common.sh) instead of walking every file on each run,
-# and use incremental journal caches for connection times. They exist
-# alongside `list`/`info` so results and timings can be compared on real data
-# before the slow implementations are replaced.
+# `list` and `info` read exact sizes from the cache maintained by
+# `refresh-sizes` (see the size-cache helpers in common.sh) instead of walking
+# every file on each run, and use incremental journal caches for connection
+# times. Walking large trees on every invocation used to take minutes.
 
 # Determine the status text/color for a user from snapshot and connection times.
 # Args: $1 = last snapshot date ("Never" or formatted), $2 = last snapshot epoch,
@@ -2499,22 +1825,22 @@ print_qgroup_inconsistency_note() {
         echo ""
         echo -e "\033[1;33m⚠ Btrfs reports quota accounting as inconsistent.\033[0m"
         echo "  With simple quotas this is expected when data existed before quotas were enabled:"
-        echo "  such extents are never attributed, so Size/Apparent below only cover data written"
-        echo "  after enablement. Do NOT toggle quotas off/on to fix it - that resets attribution"
-        echo "  for ALL current data. Use 'list' / 'info' for exact figures of existing data."
+        echo "  such extents are never attributed, so quota usage figures only cover data written"
+        echo "  after enablement (sizes from refresh-sizes are exact). Do NOT toggle quotas"
+        echo "  off/on to fix it - that resets attribution for ALL current data."
     fi
     return 0
 }
 
-# Fast list: same columns as `list`; sizes read from the size cache written by
+# List users; sizes read from the size cache written by
 # `refresh-sizes` (exact figures, computed in the background). Rows whose data
 # changed since the cache was computed are marked with '*'.
-list_users_fast() {
+list_users() {
     local arg
     for arg in "$@"; do
         case "$arg" in
             --refresh|-r) FAST_REFRESH_CONNECTIONS=true ;;
-            *) echo "Error: unknown option '$arg' for list-fast" >&2; return 1 ;;
+            *) echo "Error: unknown option '$arg' for list" >&2; return 1 ;;
         esac
     done
 
@@ -2534,7 +1860,7 @@ list_users_fast() {
         fi
     done <<< "$users"
 
-    echo "Backup Users (fast):"
+    echo "Backup Users:"
     if [ "$any_samba" = true ]; then
         echo "======================================================================================================================================================================================================"
         printf "%-16s %12s %12s %6s %12s %23s %20s %20s %10s\n" "Username" "Size(MB)" "Apparent" "Snaps" "Protocol" "Last Snapshot" "Last SFTP" "Last SMB" "Status"
@@ -2656,7 +1982,7 @@ list_users_fast() {
     fi
     local asof
     if asof=$(connection_state_asof); then
-        echo "      Connection times as of $asof (reused for up to $(( ${TERMINAS_CONNECTION_CACHE_TTL:-900} / 60 )) min; force with: $SCRIPT_NAME list-fast --refresh)"
+        echo "      Connection times as of $asof (reused for up to $(( ${TERMINAS_CONNECTION_CACHE_TTL:-900} / 60 )) min; force with: $SCRIPT_NAME list --refresh)"
     fi
     if [ "$missing" -gt 0 ]; then
         echo "      n/a = no cached size yet for $missing user(s); run: $SCRIPT_NAME refresh-sizes"
@@ -2677,16 +2003,16 @@ list_users_fast() {
     return 0
 }
 
-# Fast info: per-user detail with cached exact sizes plus the quota-accounting
+# Per-user detail with cached exact sizes plus the quota-accounting
 # view (Referenced/Exclusive per snapshot) for cross-checking.
-info_user_fast() {
+info_user() {
     local username="$1"
     shift
     local arg
     for arg in "$@"; do
         case "$arg" in
             --refresh|-r) FAST_REFRESH_CONNECTIONS=true ;;
-            *) echo "Error: unknown option '$arg' for info-fast" >&2; exit 1 ;;
+            *) echo "Error: unknown option '$arg' for info" >&2; exit 1 ;;
         esac
     done
 
@@ -2705,7 +2031,7 @@ info_user_fast() {
         exit 1
     fi
 
-    echo "User Information (fast): $username"
+    echo "User Information: $username"
     echo "========================================"
     echo "UID: $(id -u "$username")"
     echo "Groups: $(groups "$username" | cut -d: -f2)"
@@ -3749,30 +3075,19 @@ command="$1"
 shift
 
 case "$command" in
-    list|ls)
-        list_users
+    list|ls|list-fast|lsf)
+        list_users "$@"
         ;;
-    list-fast|lsf)
-        list_users_fast "$@"
-        ;;
-    info-fast)
-        if [ $# -eq 0 ]; then
-            echo "Error: Username is required for info-fast command" >&2
-            usage
-            exit 1
-        fi
-        info_user_fast "$@"
-        ;;
-    refresh-sizes)
-        refresh_sizes "$@"
-        ;;
-    info|show)
+    info|show|info-fast)
         if [ $# -eq 0 ]; then
             echo "Error: Username is required for info command" >&2
             usage
             exit 1
         fi
-        info_user "$1"
+        info_user "$@"
+        ;;
+    refresh-sizes)
+        refresh_sizes "$@"
         ;;
     history|hist)
         if [ $# -eq 0 ]; then

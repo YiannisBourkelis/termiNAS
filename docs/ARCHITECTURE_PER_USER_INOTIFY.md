@@ -1,5 +1,14 @@
 # Per-User Inotify Architecture Proposal
 
+> **Superseded (September 2026).** The monitor no longer uses inotify at all. It polls Btrfs
+> generation numbers (`btrfs subvolume list -c /home`, one call for every user) and snapshots a
+> user's `uploads` subvolume when its generation is newer than the newest snapshot's creation
+> generation and has been stable for the inactivity window. This has no per-directory cost, no
+> watch limits, and holds no kernel references, so the pending-deletion problem described below
+> no longer occurs. The change was prompted by an outage in which a user with ~500k directories
+> exhausted `max_user_watches` and the service stayed dead. This document is kept for history.
+
+
 ## Overview
 
 This document describes an alternative architecture for the termiNAS monitoring service that uses **one inotifywait process per user** instead of a single global watcher. This architecture would allow immediate cleanup of Btrfs subvolumes when users are deleted.

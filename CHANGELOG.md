@@ -7,18 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **`manage_users.sh refresh-sizes [user] [--force]`**: computes exact per-user sizes (physical via `btrfs filesystem du`, logical via a file walk) into `/var/terminas/cache/`. Users whose uploads generation and snapshot set are unchanged are skipped; each immutable snapshot's logical size is computed only once and pruned when the snapshot is deleted. Intended to run nightly from cron.
-- **`manage_users.sh list-fast` and `info-fast`** (experimental): same output as `list`/`info` but read the size cache instead of walking files, so they return instantly. `list-fast` marks rows whose data changed since their sizes were computed; `info-fast` shows a per-snapshot breakdown (cached logical size, file count, and quota-accounting Referenced/Exclusive). Provided side by side with the originals for comparison.
-- Incremental connection caches used by the `-fast` commands: SSH logins and Samba activity are read from journald with `--cursor-file`, so each run only reads entries added since the previous run instead of re-scanning 90 days (~13s on a busy server). SSH matching now includes `keyboard-interactive/pam` logins, which the original scan (password/publickey only) misses. The SSH query matches `SYSLOG_IDENTIFIER=sshd` / `sshd-session` (OpenSSH 9.8+) rather than `-u ssh.service` (a single indexed field instead of many match terms, ~4x faster on a large journal), and results are reused for `TERMINAS_CONNECTION_CACHE_TTL` seconds (default 900) since opening a large journal costs seconds by itself; `--refresh` forces a new read.
-- Shared helpers in `common.sh`: size-cache read/write/prune functions, `build_uploads_generation_cache`, `get_tree_physical_bytes`, `get_tree_logical`, `build_qgroup_usage_cache` (one-pass qgroup parser), `bytes_to_mb`, `get_snapshot_range`, `snapshot_name_to_epoch`.
+### Changed
+- **Snapshot monitor rewritten around Btrfs generation polling** (replaces recursive inotify). The monitor polls `btrfs subvolume list -c /home` (one call for all users) and snapshots a user when the uploads generation is newer than the newest snapshot's creation generation and has been stable for the inactivity window. Cost is independent of file and directory count: no inotify watch limits, no event floods, no kernel references delaying Btrfs space reclamation. Fixes the outage where a user with ~500k directories exhausted `max_user_watches` and the service silently stayed dead (the pipeline exited 0 so `Restart=on-failure` never fired; the unit now uses `Restart=always`). Also fixes the periodic-snapshot check that could never fire, replaces `lsof +D` (a full tree stat) with a `/proc/*/fd` scan, and computes quota totals with one qgroup query instead of two per snapshot. New tunable `TERMINAS_POLL_INTERVAL` (default 10s).
+- **`manage_users.sh list` and `info` now read cached sizes** computed by the new `refresh-sizes [user] [--force]` command (physical via `btrfs filesystem du --raw`, logical via a file walk, stored in `/var/terminas/cache/`). Users whose uploads generation and snapshot set are unchanged are skipped; each immutable snapshot's logical size is computed only once. `list` went from many minutes to under a second; `info` shows a per-snapshot breakdown. `setup.sh` installs a nightly cron job (03:30) for `refresh-sizes`. `list-fast`/`info-fast` are accepted as aliases.
+- Connection times (`Last SFTP`/`Last SMB`) are read from journald incrementally (`--cursor-file`) and reused for 15 minutes (`TERMINAS_CONNECTION_CACHE_TTL`, `--refresh` to force). The SSH query matches `SYSLOG_IDENTIFIER=sshd`/`sshd-session` (OpenSSH 9.8+) and includes `keyboard-interactive/pam` logins, which the previous scan missed.
+- `setup.sh` installs `common.sh` to `/var/terminas/scripts/` for the generated monitor and cleanup scripts; the monitor is generated from a quoted heredoc with placeholder substitution (no more `\$` escaping). The cleanup script's blocked-user quota recheck uses the one-pass qgroup parser.
+- Sizes in `list` are now exact bytes; the previous implementation parsed rounded GiB values (±5 MB).
 
 ### Fixed
-- Samba last-connection detection (in the `-fast` caches) no longer counts `disconnect` events as activity; the substring match for `connect` in the original implementation does.
+- Samba last-connection detection no longer counts `disconnect` events as activity.
+- `delete_user.sh` removes the deleted user's size cache.
 
 ### Notes
-- Simple-quota (`squota`) accounting cannot report sizes of data written before quotas were enabled, and toggling quotas off/on resets attribution for all existing data. The `-fast` commands therefore use exact cached figures rather than qgroup numbers for sizes; qgroup data remains the basis for quota enforcement and is shown in `info-fast` for reference. The README no longer recommends toggling quotas to "refresh" accounting.
-- The alpha.4 changelog entry stating that `list` was switched to a single qgroup fetch was inaccurate: `list` still runs `btrfs filesystem du` per user.
+- Simple-quota (`squota`) accounting cannot report sizes of data written before quotas were enabled, and toggling quotas off/on resets attribution for all existing data. Sizes therefore come from `refresh-sizes`; qgroup data remains the basis for quota enforcement. The README no longer recommends toggling quotas to "refresh" accounting.
+- The alpha.4 changelog entry stating that `list` was switched to a single qgroup fetch was inaccurate: `list` still ran `btrfs filesystem du` per user until this change.
 
 ## [1.0.0-alpha.4] - 2026-03-02
 

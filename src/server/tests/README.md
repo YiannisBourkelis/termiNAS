@@ -64,9 +64,9 @@ This test validates that user deletion completes successfully and subvolumes are
 marked for deletion.
 
 **Important Note:**
-Pending Btrfs deletions (shown by `btrfs subvolume list -d`) after user deletion are 
-**normal and expected behavior**. This is caused by inotify watches held by the 
-terminas-monitor.sh service. See the "Understanding Pending Deletions" section below for details.
+Pending Btrfs deletions (shown by `btrfs subvolume list -d`) right after user deletion are
+normal: the Btrfs cleaner reclaims space asynchronously. The former inotify-based monitor could
+delay this until a service restart; the current generation-polling monitor does not.
 
 **Usage:**
 ```bash

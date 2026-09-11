@@ -31,7 +31,7 @@ termiNAS is flexible — use it wherever you need server-side, versioned, immuta
 
 2. macOS Time Machine target (per-user)
    - Expose a per-user Time Machine share via Samba (VFS fruit). Each macOS device can have its own user/Timemachine share for isolated backups.
-   - Time Machine writes are captured by inotify and turned into immutable Btrfs snapshots for easy restores.
+   - Time Machine writes are detected by the snapshot monitor and turned into immutable Btrfs snapshots for easy restores.
 
 3. Samba network share for file sharing
    - Use the `uploads` SMB share for day-to-day file storage and collaboration between multiple machines.
@@ -524,23 +524,14 @@ sudo ./src/server/manage_users.sh force-clean
 
 **Understanding Pending Deletions:**
 
-After deleting users or snapshots, you may see "DELETED" entries in `btrfs subvolume list -d`. 
-This is **normal and expected behavior**. The deleted subvolumes continue to consume disk space 
-until the Btrfs cleaner completes the cleanup process.
+After deleting users or snapshots, `btrfs subvolume list -d` may briefly show "DELETED" entries
+while the Btrfs cleaner reclaims the space asynchronously. This is normal.
 
-**Why This Happens:**
-
-The `terminas-monitor.sh` service uses `inotifywait` to watch `/home` for file changes. These 
-inotify watches hold kernel-level references to directory inodes. When a user is deleted, the 
-watches remain active until the monitor service restarts, which delays Btrfs space reclamation.
-
-**When to use `force-clean`:**
-- If you need to immediately reclaim disk space after bulk deletions
-- After deleting many users or cleaning up old snapshots
-- **Caution**: Restarting the monitor service may cause a brief window where file upload 
-  events could be missed. If a user's upload completes exactly when the service restarts, 
-  the snapshot for that upload may not be created. This is rare but should be considered 
-  during active backup periods.
+Earlier versions of the monitor used recursive inotify watches, which held kernel references
+to deleted directories and delayed reclamation until the service restarted. The current
+monitor polls Btrfs generation numbers and holds no such references, so space is reclaimed
+by the kernel cleaner on its own. `force-clean` remains available to restart the monitor and
+force a filesystem sync if you want to confirm reclamation immediately.
 
 **Example:**
 ```bash
@@ -558,47 +549,33 @@ Pending deletions after: 0
 ✓ Cleanup complete (non-blocking - kernel cleaner will reclaim space)
 ```
 
-**Fast listing and info (experimental):**
+**Size cache (`refresh-sizes`):**
 ```bash
-# Compute exact sizes into a cache (run nightly via cron, or on demand)
 sudo ./src/server/manage_users.sh refresh-sizes            # all users, skips unchanged ones
 sudo ./src/server/manage_users.sh refresh-sizes <username> # one user
 sudo ./src/server/manage_users.sh refresh-sizes --force    # recompute everything
-
-# Same columns as `list`, reading the cache instead of walking files (instant)
-sudo ./src/server/manage_users.sh list-fast
-sudo ./src/server/manage_users.sh list-fast --refresh   # force a fresh journal read for connection times
-
-# Same as `info`, reading the cache, with a per-snapshot breakdown
-sudo ./src/server/manage_users.sh info-fast <username>
+sudo ./src/server/manage_users.sh list --refresh           # force a fresh journal read for connection times
 ```
 
-`list` and `info` walk every file in every snapshot and run `btrfs filesystem du` for
-every user on each invocation, which takes minutes on servers with large directory
-trees. The `-fast` variants read sizes from a cache in `/var/terminas/cache/` that
-`refresh-sizes` maintains:
+`list` and `info` read sizes from a cache in `/var/terminas/cache/` instead of walking every
+file on each invocation (which took minutes on servers with large directory trees).
+`setup.sh` installs a nightly cron job (03:30) that runs `refresh-sizes`; run it manually after
+installing or upgrading, or whenever you want fresh figures.
 
-- Physical usage (`btrfs filesystem du`) and the logical size of `uploads/` are
-  recomputed only for users whose data changed (detected via the Btrfs generation of
-  the uploads subvolume and the set of snapshots), so a nightly run is cheap.
-- Each snapshot's logical size is computed **once**, because snapshots are immutable,
-  and dropped when the snapshot is deleted.
-- `list-fast` marks a row with `*` when the user's data changed since its sizes were
-  computed, and shows `n/a` for users with no cached size yet.
-- Connection times come from incremental journal reads (`journalctl --cursor-file`),
-  so only entries added since the previous run are read. Because merely opening a large
-  journal costs a few seconds, the result is reused for 15 minutes (set
-  `TERMINAS_CONNECTION_CACHE_TTL` in seconds to change this); pass `--refresh` to
-  `list-fast`/`info-fast` to force a fresh read. `refresh-sizes` refreshes it as well.
-
-To keep the cache fresh automatically:
-```bash
-echo "30 3 * * * /opt/terminas/src/server/manage_users.sh refresh-sizes >> /var/log/terminas-refresh-sizes.log 2>&1" | sudo crontab -
-```
-(append to the existing root crontab rather than replacing it if you already have entries).
-
-The `-fast` commands are provided side by side with `list`/`info` so results and timings
-can be compared before the originals are replaced.
+- Physical usage (`btrfs filesystem du`) and the logical size of `uploads/` are recomputed only
+  for users whose data changed (detected via the Btrfs generation of the uploads subvolume and
+  the set of snapshots), so the nightly run is cheap.
+- Each snapshot's logical size is computed **once**, because snapshots are immutable, and
+  dropped when the snapshot is deleted.
+- `list` marks a row with `*` when the user's data changed since its sizes were computed, and
+  shows `n/a` for users with no cached size yet.
+- Connection times come from incremental journal reads (`journalctl --cursor-file`) and are
+  reused for 15 minutes (`TERMINAS_CONNECTION_CACHE_TTL` seconds to change); `--refresh`
+  forces a fresh read.
+- Simple-quota accounting (`show-quota`, and the Referenced/Exclusive columns in `info`) only
+  covers data written after quotas were enabled, and Btrfs reports it as "inconsistent" when
+  older data exists. **Do not toggle quotas off and on to "refresh"** - that resets attribution
+  for all current data.
 
 #### macOS Time Machine Support
 
@@ -644,7 +621,7 @@ sudo ./src/server/manage_users.sh enable-timemachine username
 
 **How It Works:**
 - Time Machine writes backups to the `uploads` directory via Samba
-- termiNAS's inotify monitoring service detects file changes automatically
+- termiNAS's monitoring service detects file changes automatically
 - Btrfs snapshots are created in real-time as Time Machine saves files
 - All snapshots are stored in the `versions` directory (root-owned, immutable)
 - Retention policies apply to Time Machine snapshots automatically
@@ -1097,7 +1074,7 @@ sudo ./manage_users.sh restore username 2025-10-14_12-47-05 /tmp/restore
 
 #### Snapshot Timing Configuration
 
-The monitor uses **smart periodic snapshots** that exclude in-progress files:
+The monitor detects changes by polling Btrfs generation numbers (one `btrfs subvolume list` call for all users every 10 seconds; detection latency is that interval plus the Btrfs commit interval, 30 s by default) and uses **smart periodic snapshots** that exclude in-progress files:
 
 **How it works:**
 1. **Immediate snapshot when all files complete**: No waiting - snapshot taken 60s after last file closes
@@ -1131,6 +1108,7 @@ The monitor uses **smart periodic snapshots** that exclude in-progress files:
 sudo nano /etc/systemd/system/terminas-monitor.service
 
 # Add to [Service] section:
+Environment="TERMINAS_POLL_INTERVAL=10"        # Check Btrfs generations every 10s (default)
 Environment="TERMINAS_INACTIVITY_WINDOW=60"    # Wait for 60s of inactivity before snapshot (default)
 Environment="TERMINAS_SNAPSHOT_INTERVAL=1800"  # Max wait time: force snapshot after 30 min (default)
 ```
@@ -1315,7 +1293,7 @@ To modify or extend the scripts:
 - `src/server/delete_user.sh` - User deletion
 - `src/server/manage_users.sh` - User and snapshot management
 - `src/client/linux/setup-client.sh` - Linux client backup setup (creates rclone config)
-- `/var/terminas/scripts/terminas-monitor.sh` - Real-time snapshot monitor (created by setup)
+- `/var/terminas/scripts/terminas-monitor.sh` - Real-time snapshot monitor, Btrfs generation polling (created by setup)
 - `/var/terminas/scripts/terminas-cleanup.sh` - Retention policy cleanup (created by setup)
 - `/etc/terminas-retention.conf` - Retention configuration (created by setup)
 
@@ -1377,10 +1355,9 @@ Whitelist trusted IPs (edit `/etc/fail2ban/jail.local`):
 ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 10.0.0.0/8
 ```
 
-**Known issue: Pending Btrfs deletions after snapshot removal**
+**Note: Pending Btrfs deletions after snapshot removal**
 
-- The current single inotify watcher keeps kernel references when snapshots are removed (including retention cleanup and user deletions), so Btrfs shows pending deletions and does not reclaim space until the monitor restarts. See [docs/ARCHITECTURE_PER_USER_INOTIFY.md](docs/ARCHITECTURE_PER_USER_INOTIFY.md) for the architecture discussion and proposed fixes.
-- **Workaround**: After snapshots are deleted (retention cleanup or user removal), reclaim space with `sudo ./src/server/manage_users.sh force-clean` (restarts the monitor and commits Btrfs deletions). If the script is not in your current directory, run it from its install path.
+- Deleted subvolumes are reclaimed asynchronously by the Btrfs cleaner and may show as pending for a short while. The former inotify monitor could delay this indefinitely; the current generation-polling monitor does not (see [docs/ARCHITECTURE_PER_USER_INOTIFY.md](docs/ARCHITECTURE_PER_USER_INOTIFY.md) for the history). `sudo ./src/server/manage_users.sh force-clean` restarts the monitor and syncs the filesystem if you want to check reclamation immediately.
 
 **Problem: Snapshots missing files or contain incomplete files**
 
@@ -1476,19 +1453,19 @@ sudo systemctl status terminas-monitor.service
 sudo journalctl -u terminas-monitor.service -f
 ```
 
-Check inotify limits:
+Check the monitor log for the user's generation changes and snapshot decisions:
 ```bash
-# Current limits
-cat /proc/sys/fs/inotify/max_user_watches
-cat /proc/sys/fs/inotify/max_user_instances
+sudo tail -f /var/log/terminas.log
 
-# Increase if needed (edit /etc/sysctl.conf)
-fs.inotify.max_user_watches=524288
-fs.inotify.max_user_instances=512
+# Verbose: log every generation change (add to the [Service] section of the unit, then
+# systemctl daemon-reload && systemctl restart terminas-monitor.service)
+Environment="TERMINAS_DEBUG=1"
 
-# Apply
-sudo sysctl -p
+# The monitor compares these two numbers: uploads "gen" vs. the newest snapshot's "cgen"
+sudo btrfs subvolume list -c /home | grep '<username>/'
 ```
+
+The monitor does not use inotify, so inotify watch limits are irrelevant to snapshot creation.
 
 **Problem: Disk full due to too many snapshots**
 
@@ -1531,18 +1508,18 @@ Or re-run setup script (automatically enables squotas):
 sudo ./src/server/setup.sh
 ```
 
-**Problem: Quota shows incorrect usage / not updating**
+**Problem: Quota shows lower usage than `info` / "qgroup data inconsistent" warning**
 
-In squota mode, `btrfs quota rescan` is not needed (and returns "Invalid argument"). If accounting looks stale:
+Simple quotas only account extents written *after* quotas were enabled; data that already
+existed is never attributed, `btrfs quota rescan` does not apply to squota mode, and Btrfs
+flags the accounting as "inconsistent" as long as such data exists. This is expected. Exact
+sizes come from `refresh-sizes` (`list`/`info`); quota enforcement applies to new writes.
+
+**Do not** disable and re-enable quotas to "refresh" the numbers: that resets attribution for
+all current data, so every user's accounted usage drops to zero until the data is rewritten.
 ```bash
-# Refresh accounting by toggling squotas
-sudo btrfs quota disable /home
-sudo btrfs quota enable --simple /home
-
-# Then verify
-sudo btrfs qgroup show -r /home | head
-```
-# View updated quota
+# Compare exact usage with quota-accounted usage
+sudo ./src/server/manage_users.sh info username
 sudo ./src/server/manage_users.sh show-quota username
 ```
 

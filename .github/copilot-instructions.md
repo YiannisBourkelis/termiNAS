@@ -10,7 +10,7 @@ termiNAS is a secure, versioned backup server for Debian Linux that provides ran
 
 ### Primary Objectives
 1. **Ransomware Protection**: Ensure backup versions remain intact even if client machines are compromised
-2. **Real-time Versioning**: Automatically snapshot file changes as they occur using inotify monitoring
+2. **Real-time Versioning**: Automatically snapshot file changes as they occur by polling Btrfs generation numbers (no inotify)
 3. **Secure Access Control**: Strict chroot SFTP-only access with fail2ban protection
 4. **Efficient Storage**: Use hardlinks for incremental backups to minimize disk usage
 5. **Easy Setup**: Automated configuration scripts for both server and clients
@@ -145,7 +145,7 @@ Reference documentation for key technologies used in this project:
    - Client credentials: Stored with restrictive permissions (600 Linux, Administrators-only Windows)
 
 ### Snapshot Strategy
-- **Trigger**: inotify events (`close_write`, `moved_to`) - captures complete files only
+- **Trigger**: Btrfs generation change of the uploads subvolume (polled every 10s), stable for the inactivity window; files still open for writing are excluded
 - **Method**: Btrfs snapshot (not rsync) for instant, space-efficient copies
 - **Timing**: Debounce period (default 10s) to coalesce rapid changes
 - **Storage**: CoW snapshots share data blocks with source until modified
@@ -281,7 +281,7 @@ Per-user storage quotas use **Simple Quotas (squotas)** for reliable, high-perfo
 - **Issue**: Using `create` event captures incomplete files during upload
 - **Solution**: Use only `close_write` and `moved_to` events (captures complete files)
 - **Trade-off**: Very fast uploads may complete before close_write triggers
-- **Note**: Current inotify monitor bug: snapshots cannot be deleted until the service is restarted (see docs/ARCHITECTURE_PER_USER_INOTIFY.md)
+- **Note**: The monitor no longer uses inotify; it polls Btrfs generation numbers (see README "Snapshot Timing Configuration")
 
 ### fail2ban and Testing
 - **Issue**: Testing authentication from same IP can trigger bans
