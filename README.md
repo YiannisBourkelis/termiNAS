@@ -567,6 +567,7 @@ sudo ./src/server/manage_users.sh refresh-sizes --force    # recompute everythin
 
 # Same columns as `list`, reading the cache instead of walking files (instant)
 sudo ./src/server/manage_users.sh list-fast
+sudo ./src/server/manage_users.sh list-fast --refresh   # force a fresh journal read for connection times
 
 # Same as `info`, reading the cache, with a per-snapshot breakdown
 sudo ./src/server/manage_users.sh info-fast <username>
@@ -585,7 +586,10 @@ trees. The `-fast` variants read sizes from a cache in `/var/terminas/cache/` th
 - `list-fast` marks a row with `*` when the user's data changed since its sizes were
   computed, and shows `n/a` for users with no cached size yet.
 - Connection times come from incremental journal reads (`journalctl --cursor-file`),
-  so only entries added since the previous run are read.
+  so only entries added since the previous run are read. Because merely opening a large
+  journal costs a few seconds, the result is reused for 15 minutes (set
+  `TERMINAS_CONNECTION_CACHE_TTL` in seconds to change this); pass `--refresh` to
+  `list-fast`/`info-fast` to force a fresh read. `refresh-sizes` refreshes it as well.
 
 To keep the cache fresh automatically:
 ```bash

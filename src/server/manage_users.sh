@@ -48,9 +48,9 @@ Usage: $SCRIPT_NAME <command> [options]
 
 Commands:
     list                    List all backup users with disk usage and connection status
-    list-fast               Same as list, reading cached sizes (instant; experimental)
+    list-fast [--refresh]   Same as list, reading cached sizes and connection times (instant; experimental)
     info <username>         Show detailed information including connection activity
-    info-fast <username>    Same as info, reading cached sizes, with per-snapshot breakdown (experimental)
+    info-fast <username> [--refresh]  Same as info, reading cached data, with per-snapshot breakdown (experimental)
     refresh-sizes [username] [--force]  Compute exact sizes into the cache used by list-fast/info-fast
     history <username>      Show snapshot history for a user
     search <pattern>        Search for files in latest snapshots
@@ -661,6 +661,24 @@ build_connection_cache() {
     fi
 }
 
+# True when a connection state file is younger than the reuse window
+# (TERMINAS_CONNECTION_CACHE_TTL seconds, default 900).
+connection_state_is_fresh() {
+    local state="$1"
+    local ttl="${TERMINAS_CONNECTION_CACHE_TTL:-900}"
+    local mtime
+    mtime=$(stat -c %Y "$state" 2>/dev/null) || return 1
+    [ $(( $(date +%s) - mtime )) -lt "$ttl" ]
+}
+
+# Age description of the connection state for footers ("as of HH:MM")
+connection_state_asof() {
+    local state="$TERMINAS_CACHE_DIR/ssh_logins"
+    local mtime
+    mtime=$(stat -c %Y "$state" 2>/dev/null) || return 1
+    date -d "@$mtime" "+%Y-%m-%d %H:%M"
+}
+
 # Read journal entries incrementally into a file.
 # journalctl does not accept --since together with a cursor, so the first run
 # reads the whole window with --show-cursor and saves the cursor; later runs
@@ -722,12 +740,22 @@ build_connection_cache_fast() {
         while IFS='|' read -r user epoch; do
             [ -n "$user" ] && last[$user]="$epoch"
         done < "$state"
+        # Opening a large journal costs seconds even for a cursor read, so
+        # reuse recent state unless a refresh was requested.
+        if [ "${FAST_REFRESH_CONNECTIONS:-false}" != true ] && connection_state_is_fresh "$state"; then
+            for user in "${!last[@]}"; do
+                CONNECTION_CACHE[$user]="$(date -d "@${last[$user]}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")|${last[$user]}"
+            done
+            return 0
+        fi
     fi
 
     local tmp
     tmp=$(mktemp)
+    # SYSLOG_IDENTIFIER is a single indexed field; "-u ssh.service" expands to
+    # many match terms and costs several seconds on a large journal.
     journal_read_incremental "$cursor" "90 days ago" "$tmp" \
-        -u ssh.service -u sshd.service -o short-unix --no-pager --grep 'Accepted \S+ for '
+        SYSLOG_IDENTIFIER=sshd -o short-unix --no-pager --grep 'Accepted \S+ for '
 
     while IFS='|' read -r user epoch; do
         [ -n "$user" ] || continue
@@ -801,6 +829,12 @@ build_samba_connection_cache_fast() {
         while IFS='|' read -r user epoch; do
             [ -n "$user" ] && last[$user]="$epoch"
         done < "$state"
+        if [ "${FAST_REFRESH_CONNECTIONS:-false}" != true ] && connection_state_is_fresh "$state"; then
+            for user in "${!last[@]}"; do
+                SAMBA_CONNECTION_CACHE[$user]="$(date -d "@${last[$user]}" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")|${last[$user]}"
+            done
+            return 0
+        fi
     fi
 
     local tmp
@@ -2473,6 +2507,14 @@ print_qgroup_inconsistency_note() {
 # `refresh-sizes` (exact figures, computed in the background). Rows whose data
 # changed since the cache was computed are marked with '*'.
 list_users_fast() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --refresh|-r) FAST_REFRESH_CONNECTIONS=true ;;
+            *) echo "Error: unknown option '$arg' for list-fast" >&2; return 1 ;;
+        esac
+    done
+
     local users
     users=$(get_backup_users)
     if [ -z "$users" ]; then
@@ -2609,6 +2651,10 @@ list_users_fast() {
     if [ "$stale" -gt 0 ]; then
         echo "      * = data changed since the size was computed ($stale user(s); run: $SCRIPT_NAME refresh-sizes)"
     fi
+    local asof
+    if asof=$(connection_state_asof); then
+        echo "      Connection times as of $asof (reused for up to $(( ${TERMINAS_CONNECTION_CACHE_TTL:-900} / 60 )) min; force with: $SCRIPT_NAME list-fast --refresh)"
+    fi
     if [ "$missing" -gt 0 ]; then
         echo "      n/a = no cached size yet for $missing user(s); run: $SCRIPT_NAME refresh-sizes"
     fi
@@ -2632,6 +2678,14 @@ list_users_fast() {
 # view (Referenced/Exclusive per snapshot) for cross-checking.
 info_user_fast() {
     local username="$1"
+    shift
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --refresh|-r) FAST_REFRESH_CONNECTIONS=true ;;
+            *) echo "Error: unknown option '$arg' for info-fast" >&2; exit 1 ;;
+        esac
+    done
 
     if [ -z "$username" ]; then
         echo "Error: Username is required" >&2
@@ -2874,6 +2928,14 @@ refresh_sizes() {
             echo "  removed stale cache for deleted user $user"
         fi
     done
+
+    echo "Refreshing connection caches from the journal..."
+    local conn_started
+    conn_started=$(date +%s)
+    FAST_REFRESH_CONNECTIONS=true
+    build_connection_cache_fast
+    build_samba_connection_cache_fast
+    echo "  connection caches refreshed in $(( $(date +%s) - conn_started ))s"
 
     echo "Done in $(( $(date +%s) - started ))s${failed:+ ($failed error(s))}"
     [ "$failed" -eq 0 ]
@@ -3688,7 +3750,7 @@ case "$command" in
         list_users
         ;;
     list-fast|lsf)
-        list_users_fast
+        list_users_fast "$@"
         ;;
     info-fast)
         if [ $# -eq 0 ]; then
@@ -3696,7 +3758,7 @@ case "$command" in
             usage
             exit 1
         fi
-        info_user_fast "$1"
+        info_user_fast "$@"
         ;;
     refresh-sizes)
         refresh_sizes "$@"
