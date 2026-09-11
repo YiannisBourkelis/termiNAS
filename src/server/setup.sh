@@ -558,7 +558,9 @@ cat > /var/terminas/scripts/terminas-monitor.sh <<'EOF'
 # user's newest snapshot:
 #
 #     uploads generation > newest snapshot creation generation
-#         => there are changes that no snapshot has captured yet
+#         => something changed; `btrfs subvolume find-new` then confirms
+#            that data was actually written (metadata-only changes such as
+#            atime updates from directory listings are ignored)
 #
 # A snapshot is taken once the generation has been stable for
 # TERMINAS_INACTIVITY_WINDOW seconds (upload finished), or after
@@ -708,6 +710,21 @@ hybrid_quota_check() {
 }
 
 # ---------------------------------------------------------------------------
+# Real-change test. A subvolume's generation also moves on metadata-only
+# updates (atime from a directory listing, chmod, a pure deletion), which
+# would otherwise produce empty snapshots every time a client lists the
+# share. `btrfs subvolume find-new` reports data extents written after a
+# generation using the tree's generation bounds, so it is cheap even on
+# huge trees; only new data justifies a snapshot (the same semantics as the
+# former close_write trigger).
+# ---------------------------------------------------------------------------
+has_new_data() {
+    local user="$1"
+    local since="$2"
+    btrfs subvolume find-new "$HOME_MOUNT/$user/uploads" "$since" 2>/dev/null | grep -q '^inode '
+}
+
+# ---------------------------------------------------------------------------
 # Snapshot creation
 # Returns 0 = created, 1 = failed, 2 = nothing to snapshot
 # ---------------------------------------------------------------------------
@@ -780,6 +797,8 @@ declare -A last_gen        # generation seen at the previous poll
 declare -A last_change     # epoch when the generation last changed
 declare -A active_since    # epoch when the current activity burst started (0 = idle)
 declare -A settled_gen     # generation already handled (snapshotted or nothing to do)
+declare -A checked_gen     # generation last tested with find-new
+declare -A has_data        # result of that test (1 = new data extents exist)
 
 while true; do
     now=$(printf '%(%s)T' -1)
@@ -834,6 +853,22 @@ while true; do
 
         # Anything new since the newest snapshot (or since we last handled this generation)?
         if [ "$gen" -le "${newest_ogen[$user]:-0}" ] || [ "$gen" = "${settled_gen[$user]:-}" ]; then
+            active_since[$user]=0
+            continue
+        fi
+
+        # Generation moved, but was any data written? Checked once per generation.
+        if [ "$gen" != "${checked_gen[$user]:-}" ]; then
+            checked_gen[$user]=$gen
+            if has_new_data "$user" "${newest_ogen[$user]:-0}"; then
+                has_data[$user]=1
+            else
+                has_data[$user]=0
+                debug "User $user: generation $gen has no new data extents (metadata-only change) - no snapshot"
+            fi
+        fi
+        if [ "${has_data[$user]:-0}" -eq 0 ]; then
+            settled_gen[$user]=$gen
             active_since[$user]=0
             continue
         fi

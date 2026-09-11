@@ -1074,7 +1074,7 @@ sudo ./manage_users.sh restore username 2025-10-14_12-47-05 /tmp/restore
 
 #### Snapshot Timing Configuration
 
-The monitor detects changes by polling Btrfs generation numbers (one `btrfs subvolume list` call for all users every 10 seconds; detection latency is that interval plus the Btrfs commit interval, 30 s by default) and uses **smart periodic snapshots** that exclude in-progress files:
+The monitor detects changes by polling Btrfs generation numbers (one `btrfs subvolume list` call for all users every 10 seconds; detection latency is that interval plus the Btrfs commit interval, 30 s by default). A generation change alone is not enough: `btrfs subvolume find-new` must also report new data extents, so directory listings (atime), permission changes or pure deletions never produce empty snapshots. Mounting `/home` with `noatime` (recommended anyway) avoids the metadata churn entirely. The monitor uses **smart periodic snapshots** that exclude in-progress files:
 
 **How it works:**
 1. **Immediate snapshot when all files complete**: No waiting - snapshot taken 60s after last file closes
