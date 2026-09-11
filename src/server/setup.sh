@@ -876,6 +876,8 @@ declare -A has_data        # result of that test (1 = new data extents exist)
 
 while true; do
     now=$(printf '%(%s)T' -1)
+    # Heartbeat for `manage_users.sh status` (a hung loop stops updating it)
+    : > "$RUNDIR/heartbeat"
 
     # One call for every subvolume: uploads generation and snapshot creation generations
     declare -A cur_gen=()
@@ -928,6 +930,7 @@ while true; do
         # Anything new since the newest snapshot (or since we last handled this generation)?
         if [ "$gen" -le "${newest_ogen[$user]:-0}" ] || [ "$gen" = "${settled_gen[$user]:-}" ]; then
             active_since[$user]=0
+            [ -e "$RUNDIR/pending_$user" ] && rm -f "$RUNDIR/pending_$user"
             continue
         fi
 
@@ -944,8 +947,12 @@ while true; do
         if [ "${has_data[$user]:-0}" -eq 0 ]; then
             settled_gen[$user]=$gen
             active_since[$user]=0
+            [ -e "$RUNDIR/pending_$user" ] && rm -f "$RUNDIR/pending_$user"
             continue
         fi
+
+        # Uncaptured changes exist: record since when, for `manage_users.sh status`
+        echo "${active_since[$user]}" > "$RUNDIR/pending_$user"
 
         idle=$(( now - last_change[$user] ))
         active=$(( now - active_since[$user] ))
@@ -962,6 +969,7 @@ while true; do
         if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
             settled_gen[$user]=$gen
             active_since[$user]=0
+            rm -f "$RUNDIR/pending_$user"
         fi
     done
 

@@ -818,6 +818,25 @@ sudo /var/terminas/scripts/terminas-cleanup.sh
 
 #### Monitoring
 
+**Health check (one command):**
+```bash
+sudo ./src/server/manage_users.sh status
+```
+Reports the monitor service and its poll heartbeat, users whose changes have not been
+snapshotted within the maximum interval, the last snapshot and the count in the last 24h,
+quota-blocked users, `/home` usage, whether the nightly cron jobs exist and ran, SSH/fail2ban/
+Samba state, and Btrfs housekeeping. The exit code follows the monitoring convention
+(0 = OK, 1 = WARNING, 2 = CRITICAL), and `--quiet` prints only problems, so cron mails you
+only when something needs attention:
+```bash
+# /etc/cron.d/terminas-health (cron mails any output to MAILTO)
+MAILTO=admin@example.com
+*/10 * * * * root /opt/terminas/src/server/manage_users.sh status --quiet
+```
+Thresholds: `/home` usage warns at 80% and is critical at 95% (`TERMINAS_DISK_WARN_PCT`,
+`TERMINAS_DISK_CRIT_PCT`); changes are critical when not captured within the snapshot
+interval plus the inactivity window.
+
 **View backup activity logs:**
 ```bash
 sudo tail -f /var/log/terminas.log

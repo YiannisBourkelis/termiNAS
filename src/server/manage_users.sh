@@ -50,6 +50,7 @@ Commands:
     list [--refresh]        List all backup users with disk usage and connection status
     info <username> [--refresh]  Show detailed information including connection activity
     refresh-sizes [username] [--force]  Compute exact sizes into the cache used by list/info (run nightly)
+    status [--quiet]        Health check: monitor, uncaptured changes, quota blocks, disk, cron jobs (exit 0/1/2)
     history <username>      Show snapshot history for a user
     search <pattern>        Search for files in latest snapshots
     inactive [days]         List users with no recent uploads (default: 30 days)
@@ -76,6 +77,7 @@ Commands:
 
 Examples:
     $SCRIPT_NAME list
+    $SCRIPT_NAME status
     $SCRIPT_NAME info testuser
     $SCRIPT_NAME history testuser
     $SCRIPT_NAME search "*.pdf"
@@ -2270,6 +2272,221 @@ refresh_sizes() {
     [ "$failed" -eq 0 ]
 }
 
+# ---------------------------------------------------------------------------
+# status [--quiet]: health summary with a monitoring-friendly exit code
+#   0 = OK, 1 = WARNING, 2 = CRITICAL   (Nagios/Icinga convention)
+# --quiet prints only problems, so a cron entry mails you only when something
+# is wrong:   */10 * * * * /opt/terminas/src/server/manage_users.sh status --quiet
+# ---------------------------------------------------------------------------
+STATUS_WORST=0
+STATUS_QUIET=false
+status_report() {
+    local lvl="$1"; shift
+    local tag
+    case "$lvl" in 0) tag="[ OK ]" ;; 1) tag="[WARN]" ;; *) tag="[CRIT]" ;; esac
+    [ "$lvl" -gt "$STATUS_WORST" ] && STATUS_WORST=$lvl
+    if [ "$STATUS_QUIET" = false ] || [ "$lvl" -gt 0 ]; then
+        echo "$tag $*"
+    fi
+}
+
+# Read TERMINAS_* settings from the running unit (falls back to defaults)
+status_monitor_setting() {
+    local name="$1" default="$2"
+    local v
+    v=$(systemctl show -p Environment --value terminas-monitor.service 2>/dev/null | tr ' ' '\n' | grep "^${name}=" | tail -1 | cut -d= -f2)
+    echo "${v:-$default}"
+}
+
+status_check() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --quiet|-q) STATUS_QUIET=true ;;
+            *) echo "Error: unknown option '$arg' for status" >&2; return 2 ;;
+        esac
+    done
+
+    local now
+    now=$(date +%s)
+    local rundir=/var/run/terminas
+    local monitor_script=/var/terminas/scripts/terminas-monitor.sh
+    local poll inactivity snap_interval
+    poll=$(status_monitor_setting TERMINAS_POLL_INTERVAL 10)
+    inactivity=$(status_monitor_setting TERMINAS_INACTIVITY_WINDOW 60)
+    snap_interval=$(status_monitor_setting TERMINAS_SNAPSHOT_INTERVAL 1800)
+
+    [ "$STATUS_QUIET" = false ] && echo "termiNAS health - $(date '+%Y-%m-%d %H:%M:%S') on $(hostname)"
+
+    # --- monitor service ---
+    local active since nrestarts
+    active=$(systemctl is-active terminas-monitor.service 2>/dev/null || true)
+    if [ "$active" = "active" ]; then
+        since=$(systemctl show -p ActiveEnterTimestamp --value terminas-monitor.service 2>/dev/null | cut -d' ' -f2-3)
+        nrestarts=$(systemctl show -p NRestarts --value terminas-monitor.service 2>/dev/null || echo 0)
+        if [ "${nrestarts:-0}" -gt 0 ]; then
+            status_report 1 "Monitor service active since $since, but restarted $nrestarts time(s) (journalctl -u terminas-monitor.service)"
+        else
+            status_report 0 "Monitor service active since $since"
+        fi
+    else
+        status_report 2 "Monitor service is ${active:-not found} - snapshots are NOT being created (systemctl start terminas-monitor.service)"
+    fi
+
+    # --- monitor script version and liveness ---
+    if [ ! -f "$monitor_script" ]; then
+        status_report 2 "Monitor script missing ($monitor_script) - run setup.sh"
+    elif ! grep -q 'generation polling' "$monitor_script"; then
+        status_report 1 "Monitor script is the legacy inotify version - run setup.sh to upgrade"
+    elif [ -f "$rundir/heartbeat" ]; then
+        local hb_age=$(( now - $(stat -c %Y "$rundir/heartbeat" 2>/dev/null || echo 0) ))
+        local hb_max=$(( poll * 6 + 120 ))
+        if [ "$active" = "active" ] && [ "$hb_age" -gt "$hb_max" ]; then
+            status_report 2 "Monitor loop stalled: last poll ${hb_age}s ago (expected every ${poll}s)"
+        elif [ "$active" = "active" ]; then
+            status_report 0 "Monitor loop alive: last poll ${hb_age}s ago"
+        fi
+    elif [ "$active" = "active" ]; then
+        status_report 1 "No monitor heartbeat yet (monitor predates heartbeat support or just started - re-run setup.sh if this persists)"
+    fi
+
+    # --- uncaptured changes ---
+    local f u p_since p_age pending=0 overdue=0 overdue_list=""
+    local overdue_after=$(( snap_interval + inactivity + poll * 3 + 120 ))
+    for f in "$rundir"/pending_*; do
+        [ -f "$f" ] || continue
+        u="${f##*/pending_}"
+        p_since=$(cat "$f" 2>/dev/null || echo "$now")
+        p_age=$(( now - p_since ))
+        pending=$((pending + 1))
+        if [ "$p_age" -gt "$overdue_after" ]; then
+            overdue=$((overdue + 1))
+            overdue_list="$overdue_list $u ($((p_age / 60)) min)"
+        fi
+    done
+    if [ "$overdue" -gt 0 ]; then
+        status_report 2 "Changes not snapshotted within the maximum interval:$overdue_list"
+    elif [ "$pending" -gt 0 ]; then
+        status_report 0 "$pending user(s) with changes waiting for the inactivity window"
+    else
+        status_report 0 "No uncaptured changes"
+    fi
+
+    # --- snapshot activity from the log ---
+    local last_snap count24
+    if [ -f /var/log/terminas.log ]; then
+        last_snap=$(grep 'Btrfs snapshot created for' /var/log/terminas.log | tail -1 | sed -E 's/^([0-9-]+ [0-9:]+) Btrfs snapshot created for ([^ ]+) .*/\1 (\2)/')
+        count24=$(awk -v since="$(date -d '24 hours ago' '+%F %T')" '/Btrfs snapshot created for/ && ($1 " " $2) >= since' /var/log/terminas.log | wc -l)
+        if [ -n "$last_snap" ]; then
+            status_report 0 "Last snapshot: $last_snap; $count24 snapshot(s) in the last 24h"
+        else
+            status_report 1 "No snapshot recorded in /var/log/terminas.log"
+        fi
+    else
+        status_report 1 "Log file /var/log/terminas.log not found"
+    fi
+
+    # --- quota-blocked users ---
+    local blocked=""
+    for f in /home/*/.terminas-quota-exceeded; do
+        [ -f "$f" ] || continue
+        u="${f#/home/}"; u="${u%%/*}"
+        blocked="$blocked $u"
+    done
+    if [ -n "$blocked" ]; then
+        status_report 1 "Uploads blocked (over quota):$blocked"
+    else
+        status_report 0 "No users blocked by quota"
+    fi
+
+    # --- disk space on /home ---
+    local warn_pct="${TERMINAS_DISK_WARN_PCT:-80}" crit_pct="${TERMINAS_DISK_CRIT_PCT:-95}"
+    local df_line used size pct
+    df_line=$(df -h /home 2>/dev/null | awk 'NR==2 {print $3 "|" $2 "|" $5}')
+    used="${df_line%%|*}"; size=$(echo "$df_line" | cut -d'|' -f2); pct="${df_line##*|}"; pct="${pct%\%}"
+    if [ -n "$pct" ] && [ "$pct" -ge "$crit_pct" ] 2>/dev/null; then
+        status_report 2 "/home is ${pct}% full ($used of $size)"
+    elif [ -n "$pct" ] && [ "$pct" -ge "$warn_pct" ] 2>/dev/null; then
+        status_report 1 "/home is ${pct}% full ($used of $size)"
+    else
+        status_report 0 "/home usage ${pct:-?}% ($used of $size)"
+    fi
+
+    # --- scheduled maintenance ---
+    local cron
+    cron=$(crontab -l 2>/dev/null || true)
+    if ! echo "$cron" | grep -q 'terminas-cleanup.sh'; then
+        status_report 1 "Retention cleanup cron job missing (run setup.sh)"
+    elif [ -f /var/log/terminas.log ]; then
+        local last_cleanup
+        last_cleanup=$(grep '\[CLEANUP\] All maintenance tasks completed' /var/log/terminas.log | tail -1 | cut -c1-16)
+        if [ -z "$last_cleanup" ]; then
+            status_report 1 "Retention cleanup has not completed yet (first run at 03:00)"
+        elif [ $(( now - $(date -d "$last_cleanup" +%s 2>/dev/null || echo 0) )) -gt $(( 26 * 3600 )) ]; then
+            status_report 1 "Retention cleanup last completed $last_cleanup (more than 26h ago)"
+        else
+            status_report 0 "Retention cleanup last completed $last_cleanup"
+        fi
+    fi
+    if ! echo "$cron" | grep -q 'refresh-sizes'; then
+        status_report 1 "Size-cache refresh cron job missing (run setup.sh)"
+    elif [ -f /var/log/terminas-refresh-sizes.log ]; then
+        local rs_age=$(( now - $(stat -c %Y /var/log/terminas-refresh-sizes.log) ))
+        if [ "$rs_age" -gt $(( 26 * 3600 )) ]; then
+            status_report 1 "Size cache last refreshed $((rs_age / 3600))h ago (cron at 03:30 may have failed)"
+        else
+            status_report 0 "Size cache refreshed $((rs_age / 3600))h ago"
+        fi
+    elif [ ! -d "$TERMINAS_CACHE_DIR/sizes" ] || [ -z "$(ls -A "$TERMINAS_CACHE_DIR/sizes" 2>/dev/null)" ]; then
+        status_report 1 "Size cache empty - run: $SCRIPT_NAME refresh-sizes"
+    else
+        status_report 0 "Size cache present (nightly cron not run yet)"
+    fi
+
+    # --- supporting services ---
+    if [ "$(systemctl is-active ssh.service 2>/dev/null || systemctl is-active sshd.service 2>/dev/null)" != "active" ]; then
+        status_report 2 "SSH service is not active - clients cannot upload"
+    else
+        status_report 0 "SSH service active"
+    fi
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        if [ "$(systemctl is-active fail2ban 2>/dev/null)" = "active" ]; then
+            status_report 0 "fail2ban active"
+        else
+            status_report 1 "fail2ban is not active"
+        fi
+    fi
+    if has_samba_installed && ls /etc/samba/smb.conf.d/*.conf >/dev/null 2>&1; then
+        if [ "$(systemctl is-active smbd 2>/dev/null)" = "active" ]; then
+            status_report 0 "Samba active"
+        else
+            status_report 1 "Samba users are configured but smbd is not active"
+        fi
+    fi
+
+    # --- Btrfs housekeeping ---
+    local pending_del
+    pending_del=$(btrfs subvolume list -d /home 2>/dev/null | grep -c DELETED || true)
+    status_report 0 "Btrfs pending subvolume deletions: ${pending_del:-0}"
+    if build_qgroup_usage_cache /home 2>/dev/null; then
+        if [ "$QGROUP_INCONSISTENT" = true ]; then
+            status_report 0 "Quota accounting: enabled (marked inconsistent - expected with pre-quota data)"
+        else
+            status_report 0 "Quota accounting: enabled"
+        fi
+    else
+        status_report 1 "Btrfs quotas are not enabled on /home (quota limits are not enforced)"
+    fi
+
+    # --- overall ---
+    local overall
+    case "$STATUS_WORST" in 0) overall="OK" ;; 1) overall="WARNING" ;; *) overall="CRITICAL" ;; esac
+    if [ "$STATUS_QUIET" = false ] || [ "$STATUS_WORST" -gt 0 ]; then
+        echo "Overall: $overall"
+    fi
+    return "$STATUS_WORST"
+}
+
 # Show snapshot history for a user
 history_user() {
     local username="$1"
@@ -3088,6 +3305,10 @@ case "$command" in
         ;;
     refresh-sizes)
         refresh_sizes "$@"
+        ;;
+    status|health)
+        status_check "$@"
+        exit $?
         ;;
     history|hist)
         if [ $# -eq 0 ]; then
