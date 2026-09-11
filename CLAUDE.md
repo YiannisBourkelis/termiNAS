@@ -78,7 +78,7 @@ Uses Btrfs **simple quotas** (`btrfs quota enable --simple /home`) — never ful
 1. **Hard limit**: level-0 qgroup on the `uploads` subvolume blocks writes at the filesystem level.
 2. **Hybrid total check**: after each snapshot the monitor sums uploads + all snapshots (exclusive bytes); if over the limit it sets the uploads qgroup limit to 1 byte and writes `.terminas-quota-exceeded`. Unblocked automatically when the blocked user's data changes again (deletions) or by the daily cleanup recheck.
 
-Note: in squota mode `btrfs quota rescan` is invalid, and **never toggle quotas off/on to "refresh"** — extents that exist when squota is enabled are never attributed, so a toggle zeroes the accounting for all current data (this is why Btrfs reports the accounting as "inconsistent" on servers with pre-quota data). Details in `docs/QUOTA_ARCHITECTURE.md`.
+Check the mode with `get_btrfs_quota_mode` (sysfs `qgroups/mode`, kernel 6.7+): `status` and `setup.sh` warn when `/home` is in full `qgroup` mode (exclusive excludes snapshot-shared data, so the hybrid total undercounts; the kernel stops counting new data while flagged inconsistent until a rescan). `manage_users.sh migrate-squota` converts and re-applies limits. In squota mode `btrfs quota rescan` is invalid and **never toggle quotas off/on to "refresh"** — extents that exist when squota is enabled are never attributed, so a toggle zeroes the accounting for all current data. Yiannis's dev server was found in full mode in Sep 2026. Details in `docs/QUOTA_ARCHITECTURE.md`.
 
 ### Retention
 

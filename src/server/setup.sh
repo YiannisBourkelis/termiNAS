@@ -14,6 +14,10 @@
 
 # Get version from VERSION file in repository root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared helpers (quota mode detection, parsing)
+if [ -f "$SCRIPT_DIR/common.sh" ]; then
+    source "$SCRIPT_DIR/common.sh"
+fi
 VERSION_FILE="$SCRIPT_DIR/../../VERSION"
 if [ -f "$VERSION_FILE" ]; then
     VERSION=$(cat "$VERSION_FILE" | tr -d '[:space:]')
@@ -174,7 +178,20 @@ echo ""
 # by attributing all extents to the subvolume that first allocated them
 echo "Enabling Btrfs simple quotas on /home..."
 if btrfs qgroup show /home &>/dev/null; then
-    echo "  ✓ Btrfs quotas already enabled"
+    QUOTA_MODE=$(get_btrfs_quota_mode /home)
+    case "$QUOTA_MODE" in
+        squota)
+            echo "  ✓ Btrfs simple quotas (squota) already enabled" ;;
+        qgroup)
+            echo "  ⚠ Btrfs quotas are enabled in FULL accounting mode, not simple quotas."
+            echo "    termiNAS is designed for simple quotas: full mode undercounts the per-user"
+            echo "    total (uploads + snapshots), adds accounting work to every snapshot, and"
+            echo "    stops counting new data whenever the accounting is marked inconsistent."
+            echo "    Migrate with:  $SCRIPT_DIR/manage_users.sh migrate-squota"
+            echo "    (existing data is not attributed under simple quotas; new writes are)" ;;
+        *)
+            echo "  ✓ Btrfs quotas already enabled (mode: $QUOTA_MODE)" ;;
+    esac
 else
     if btrfs quota enable --simple /home; then
         echo "  ✓ Enabled Btrfs simple quotas (squotas)"

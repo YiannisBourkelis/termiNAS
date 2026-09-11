@@ -51,6 +51,7 @@ Commands:
     info <username> [--refresh]  Show detailed information including connection activity
     refresh-sizes [username] [--force]  Compute exact sizes into the cache used by list/info (run nightly)
     status [--quiet]        Health check: monitor, uncaptured changes, quota blocks, disk, cron jobs (exit 0/1/2)
+    migrate-squota [--yes]  Switch /home from full qgroup accounting to simple quotas, re-applying all limits
     history <username>      Show snapshot history for a user
     search <pattern>        Search for files in latest snapshots
     inactive [days]         List users with no recent uploads (default: 30 days)
@@ -1826,10 +1827,17 @@ print_qgroup_inconsistency_note() {
     if [ "${QGROUP_INCONSISTENT:-false}" = true ]; then
         echo ""
         echo -e "\033[1;33m⚠ Btrfs reports quota accounting as inconsistent.\033[0m"
-        echo "  With simple quotas this is expected when data existed before quotas were enabled:"
-        echo "  such extents are never attributed, so quota usage figures only cover data written"
-        echo "  after enablement (sizes from refresh-sizes are exact). Do NOT toggle quotas"
-        echo "  off/on to fix it - that resets attribution for ALL current data."
+        case "$(get_btrfs_quota_mode /home)" in
+            qgroup)
+                echo "  /home uses FULL qgroup accounting: new data is not counted until a rescan"
+                echo "  completes (btrfs quota rescan /home), and per-user totals exclude data shared"
+                echo "  with snapshots. termiNAS is designed for simple quotas: $SCRIPT_NAME migrate-squota" ;;
+            *)
+                echo "  With simple quotas this is expected when data existed before quotas were enabled:"
+                echo "  such extents are never attributed, so quota usage figures only cover data written"
+                echo "  after enablement (sizes from refresh-sizes are exact). Do NOT toggle quotas"
+                echo "  off/on to fix it - that resets attribution for ALL current data." ;;
+        esac
     fi
     return 0
 }
@@ -2268,7 +2276,11 @@ refresh_sizes() {
     build_samba_connection_cache_fast
     echo "  connection caches refreshed in $(( $(date +%s) - conn_started ))s"
 
-    echo "Done in $(( $(date +%s) - started ))s${failed:+ ($failed error(s))}"
+    if [ "$failed" -gt 0 ]; then
+        echo "Done in $(( $(date +%s) - started ))s ($failed error(s))"
+    else
+        echo "Done in $(( $(date +%s) - started ))s"
+    fi
     [ "$failed" -eq 0 ]
 }
 
@@ -2468,15 +2480,20 @@ status_check() {
     local pending_del
     pending_del=$(btrfs subvolume list -d /home 2>/dev/null | grep -c DELETED || true)
     status_report 0 "Btrfs pending subvolume deletions: ${pending_del:-0}"
-    if build_qgroup_usage_cache /home 2>/dev/null; then
-        if [ "$QGROUP_INCONSISTENT" = true ]; then
-            status_report 0 "Quota accounting: enabled (marked inconsistent - expected with pre-quota data)"
-        else
-            status_report 0 "Quota accounting: enabled"
-        fi
-    else
-        status_report 1 "Btrfs quotas are not enabled on /home (quota limits are not enforced)"
-    fi
+    local qmode
+    qmode=$(get_btrfs_quota_mode /home)
+    case "$qmode" in
+        squota)
+            status_report 0 "Quota accounting: simple quotas (squota)" ;;
+        qgroup)
+            local rescan_note=""
+            quota_rescan_running /home && rescan_note=", rescan running"
+            status_report 1 "Quota accounting: FULL qgroup mode${rescan_note} - per-user totals undercount shared data; migrate with: $SCRIPT_NAME migrate-squota" ;;
+        disabled)
+            status_report 1 "Btrfs quotas are not enabled on /home (quota limits are not enforced)" ;;
+        *)
+            status_report 0 "Quota accounting: enabled (mode unknown on this kernel)" ;;
+    esac
 
     # --- overall ---
     local overall
@@ -2485,6 +2502,126 @@ status_check() {
         echo "Overall: $overall"
     fi
     return "$STATUS_WORST"
+}
+
+# migrate-squota [--yes]: switch /home from full qgroup accounting to simple
+# quotas and re-apply every user's configured limit.
+migrate_squota() {
+    local yes=false arg
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y) yes=true ;;
+            *) echo "Error: unknown option '$arg' for migrate-squota" >&2; return 1 ;;
+        esac
+    done
+
+    local mode
+    mode=$(get_btrfs_quota_mode /home)
+    case "$mode" in
+        squota)  echo "Btrfs quotas on /home are already in simple (squota) mode. Nothing to do."; return 0 ;;
+        qgroup)  ;;
+        disabled) echo "Btrfs quotas are not enabled on /home. Run setup.sh, which enables simple quotas."; return 1 ;;
+        *) echo "Cannot determine the quota mode (kernel without /sys/fs/btrfs/<uuid>/qgroups/mode)." >&2
+           echo "If you know /home uses full qgroups, run manually:" >&2
+           echo "  btrfs quota disable /home && btrfs quota enable --simple /home" >&2
+           echo "then re-apply limits with: $SCRIPT_NAME set-quota <user> <limit>" >&2
+           return 1 ;;
+    esac
+
+    # `btrfs quota rescan -s` prints "no rescan operation in progress" when idle
+    # and "rescan operation running ..." while one is active
+    if quota_rescan_running /home; then
+        echo "Error: a quota rescan is running. Wait for it to finish (btrfs quota rescan -s /home) and retry." >&2
+        return 1
+    fi
+
+    # Collect configured limits before touching anything
+    local users user limit_raw parsed
+    local -a to_apply=()
+    users=$(get_backup_users)
+    while IFS= read -r user; do
+        [ -n "$user" ] || continue
+        limit_raw=$(cat "/home/$user/.terminas-quota-limit" 2>/dev/null || echo 0)
+        if parsed=$(parse_quota_value "$limit_raw") && [ "${parsed%%|*}" -gt 0 ]; then
+            to_apply+=("$user|${parsed%%|*}|${parsed##*|}")
+        fi
+    done <<< "$users"
+
+    echo "=========================================="
+    echo "Migrate /home to Btrfs simple quotas"
+    echo "=========================================="
+    echo ""
+    echo "Current mode: full qgroup accounting"
+    echo "Users with a quota limit to re-apply: ${#to_apply[@]}"
+    local entry
+    for entry in "${to_apply[@]}"; do
+        echo "  - ${entry%%|*}: ${entry##*|}"
+    done
+    echo ""
+    echo "What happens:"
+    echo "  1. btrfs quota disable /home      (all qgroups and limits are dropped)"
+    echo "  2. btrfs quota enable --simple /home"
+    echo "  3. every listed limit is re-applied to the user's uploads subvolume"
+    echo "  4. .terminas-quota-exceeded flags are cleared (the monitor re-evaluates)"
+    echo ""
+    echo "Consequences:"
+    echo "  - Data that already exists is NOT attributed under simple quotas; usage figures"
+    echo "    from quota accounting start near zero and grow as data is written or rewritten."
+    echo "    Exact sizes in 'list'/'info' (refresh-sizes) are unaffected."
+    echo "  - Quota enforcement is lenient for existing data until it is rewritten."
+    echo "  - Btrfs will report the accounting as 'inconsistent'; that is expected and permanent"
+    echo "    for a filesystem that had data before simple quotas were enabled."
+    echo "  - Do not run this again later to 'refresh': it resets the attribution every time."
+    echo ""
+    if [ "$yes" != true ]; then
+        read -r -p "Proceed? (yes/no): " answer
+        [ "$answer" = "yes" ] || { echo "Aborted."; return 1; }
+    fi
+
+    echo ""
+    echo "Disabling full qgroup accounting..."
+    if ! btrfs quota disable /home; then
+        echo "Error: btrfs quota disable failed; nothing changed." >&2
+        return 1
+    fi
+    echo "Enabling simple quotas..."
+    if ! btrfs quota enable --simple /home; then
+        echo "Error: btrfs quota enable --simple failed. Quotas are now DISABLED on /home." >&2
+        echo "Re-run setup.sh (or 'btrfs quota enable --simple /home') and then re-apply limits with set-quota." >&2
+        return 1
+    fi
+    mode=$(get_btrfs_quota_mode /home)
+    echo "  mode now: $mode"
+
+    local applied=0 failed=0 subvol_id qgroup
+    for entry in "${to_apply[@]}"; do
+        user="${entry%%|*}"
+        local bytes; bytes=$(echo "$entry" | cut -d'|' -f2)
+        subvol_id=$(btrfs subvolume show "/home/$user/uploads" 2>/dev/null | grep -oP 'Subvolume ID:\s+\K[0-9]+' || true)
+        if [ -z "$subvol_id" ]; then
+            echo "  ✗ $user: uploads subvolume not found, limit NOT applied" >&2
+            failed=$((failed + 1)); continue
+        fi
+        qgroup="0/$subvol_id"
+        if btrfs qgroup limit "$bytes" "$qgroup" /home 2>/dev/null; then
+            echo "$qgroup" > "/home/$user/.terminas-qgroup"
+            rm -f "/home/$user/.terminas-quota-exceeded" 2>/dev/null || true
+            echo "  ✓ $user: ${entry##*|} applied to $qgroup"
+            applied=$((applied + 1))
+        else
+            echo "  ✗ $user: failed to apply limit to $qgroup" >&2
+            failed=$((failed + 1))
+        fi
+    done
+
+    echo ""
+    if [ "$failed" -gt 0 ]; then
+        echo "Migration complete: $applied limit(s) re-applied, $failed failed."
+    else
+        echo "Migration complete: $applied limit(s) re-applied."
+    fi
+    echo "Verify with: $SCRIPT_NAME status   and   $SCRIPT_NAME show-quota <user>"
+    [ "$failed" -eq 0 ]
 }
 
 # Show snapshot history for a user
@@ -3309,6 +3446,9 @@ case "$command" in
     status|health)
         status_check "$@"
         exit $?
+        ;;
+    migrate-squota)
+        migrate_squota "$@"
         ;;
     history|hist)
         if [ $# -eq 0 ]; then

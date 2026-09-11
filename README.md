@@ -1529,13 +1529,24 @@ sudo ./src/server/setup.sh
 
 **Problem: Quota shows lower usage than `info` / "qgroup data inconsistent" warning**
 
-Simple quotas only account extents written *after* quotas were enabled; data that already
-existed is never attributed, `btrfs quota rescan` does not apply to squota mode, and Btrfs
-flags the accounting as "inconsistent" as long as such data exists. This is expected. Exact
-sizes come from `refresh-sizes` (`list`/`info`); quota enforcement applies to new writes.
+First check which quota mode `/home` is in (`status` reports it too):
+```bash
+cat /sys/fs/btrfs/$(findmnt -no UUID --target /home)/qgroups/mode    # squota or qgroup
+```
 
-**Do not** disable and re-enable quotas to "refresh" the numbers: that resets attribution for
-all current data, so every user's accounted usage drops to zero until the data is rewritten.
+- **`qgroup` (full accounting)** — termiNAS is designed for simple quotas, and servers set up
+  before the simple-quota design (or where quotas were enabled by hand) may still run full mode.
+  In full mode per-user totals exclude data shared with snapshots (so the uploads+snapshots check
+  undercounts), every snapshot carries accounting work, and while the accounting is flagged
+  "inconsistent" the kernel does not count new data at all until `btrfs quota rescan /home`
+  completes. Migrate with `sudo ./src/server/manage_users.sh migrate-squota` (it re-applies all
+  configured limits). Existing data is not attributed under simple quotas; new writes are.
+- **`squota` (simple quotas)** — only extents written *after* quotas were enabled are accounted;
+  data that already existed is never attributed, `btrfs quota rescan` does not apply, and Btrfs
+  flags the accounting as "inconsistent" as long as such data exists. This is expected. Exact
+  sizes come from `refresh-sizes` (`list`/`info`); quota enforcement applies to new writes.
+  **Do not** disable and re-enable quotas to "refresh" the numbers: that resets attribution for
+  all current data.
 ```bash
 # Compare exact usage with quota-accounted usage
 sudo ./src/server/manage_users.sh info username

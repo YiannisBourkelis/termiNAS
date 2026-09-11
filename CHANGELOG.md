@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `setup.sh` installs `common.sh` to `/var/terminas/scripts/` for the generated monitor and cleanup scripts; the monitor is generated from a quoted heredoc with placeholder substitution (no more `\$` escaping). The cleanup script's blocked-user quota recheck uses the one-pass qgroup parser.
 - Sizes in `list` are now exact bytes; the previous implementation parsed rounded GiB values (±5 MB).
 
+- **`manage_users.sh migrate-squota [--yes]`**: converts `/home` from full qgroup accounting to simple quotas and re-applies every configured limit. `setup.sh` and `status` now detect the quota mode via sysfs and warn when full mode is in use (the alpha.3 notes mentioned migration tooling, but none existed; servers set up earlier may still run full mode, where per-user totals undercount snapshot-shared data and new data is not counted while the accounting is flagged inconsistent).
 - **`manage_users.sh status [--quiet]`**: one-command health check with Nagios-style exit codes (0/1/2) covering the monitor service and its poll heartbeat, changes not snapshotted within the maximum interval, quota-blocked users, `/home` usage, nightly cron jobs, SSH/fail2ban/Samba, and Btrfs housekeeping. The monitor now writes a heartbeat and per-user pending markers under `/var/run/terminas/` for it.
 
 ### Fixed

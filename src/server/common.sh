@@ -426,3 +426,39 @@ refresh_snapshot_size_cache() {
 
     echo "${total_bytes}|${total_files}|${count}|${computed}"
 }
+
+# ---------------------------------------------------------------------------
+# Btrfs quota mode
+# ---------------------------------------------------------------------------
+# termiNAS is designed for simple quotas (squota): each extent is attributed to
+# exactly one subvolume, so summing Exclusive over a user's subvolumes is the
+# user's real footprint, and snapshot creation carries no accounting cost.
+# Under full qgroup accounting ("qgroup" mode) Exclusive excludes anything
+# shared with a snapshot, the hybrid total check undercounts, and the kernel
+# stops accounting new extents whenever the "inconsistent" flag is set until a
+# full rescan completes.
+# Prints: squota | qgroup | disabled | unknown   (unknown = kernel < 6.7 sysfs)
+# Usage: get_btrfs_quota_mode [mountpoint]
+get_btrfs_quota_mode() {
+    local mount="${1:-/home}"
+    if ! btrfs qgroup show "$mount" >/dev/null 2>&1; then
+        echo "disabled"
+        return 0
+    fi
+    local uuid
+    uuid=$(findmnt -no UUID --target "$mount" 2>/dev/null)
+    local mode_file="${TERMINAS_SYSFS_BTRFS:-/sys/fs/btrfs}/$uuid/qgroups/mode"
+    if [ -n "$uuid" ] && [ -r "$mode_file" ]; then
+        cat "$mode_file"
+    else
+        echo "unknown"
+    fi
+}
+
+# True while a full-qgroup rescan is running on the mount
+# ("btrfs quota rescan -s" prints "no rescan operation in progress" when idle)
+quota_rescan_running() {
+    local out
+    out=$(btrfs quota rescan -s "${1:-/home}" 2>/dev/null || true)
+    echo "$out" | grep -qi 'running'
+}
