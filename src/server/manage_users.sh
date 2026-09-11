@@ -661,6 +661,43 @@ build_connection_cache() {
     fi
 }
 
+# Read journal entries incrementally into a file.
+# journalctl does not accept --since together with a cursor, so the first run
+# reads the whole window with --show-cursor and saves the cursor; later runs
+# pass only --cursor-file (which journalctl updates at the end). If the saved
+# cursor is unusable (e.g. journal vacuumed) the full window is re-read.
+# journalctl errors are reported on stderr instead of being hidden.
+# Usage: journal_read_incremental <cursor_file> <since> <out_file> <journalctl args...>
+journal_read_incremental() {
+    local cursor="$1" since="$2" out="$3"
+    shift 3
+    local err
+    err=$(mktemp)
+
+    if [ -s "$cursor" ]; then
+        if journalctl -q "$@" --cursor-file="$cursor" >"$out" 2>"$err" || [ ! -s "$err" ]; then
+            rm -f "$err"
+            return 0
+        fi
+        echo "Warning: incremental journal read failed ($(head -1 "$err")); re-reading last $since" >&2
+        rm -f "$cursor"
+        : > "$err"
+    fi
+
+    journalctl -q "$@" --since "$since" --show-cursor >"$out" 2>"$err" || true
+    if [ -s "$err" ]; then
+        echo "Warning: journalctl: $(head -1 "$err")" >&2
+    fi
+    rm -f "$err"
+
+    local c
+    c=$(grep '^-- cursor: ' "$out" | tail -1 | sed 's/^-- cursor: //')
+    if [ -n "$c" ]; then
+        echo "$c" > "$cursor"
+    fi
+    return 0
+}
+
 # Incremental SSH login cache. Reads the journal with native timestamps and
 # native filtering, and keeps a cursor so each run only reads entries added
 # since the previous run (a full 90-day read costs ~13s on a busy server; the
@@ -687,21 +724,18 @@ build_connection_cache_fast() {
         done < "$state"
     fi
 
-    local args=(-u ssh.service -u sshd.service --since "90 days ago" -o short-unix --no-pager --grep 'Accepted \S+ for ')
     local tmp
     tmp=$(mktemp)
-    if ! journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null; then
-        # Cursor may point at a vacuumed journal entry: start over
-        rm -f "$cursor"
-        journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null || true
-    fi
+    journal_read_incremental "$cursor" "90 days ago" "$tmp" \
+        -u ssh.service -u sshd.service -o short-unix --no-pager --grep 'Accepted \S+ for '
 
     while IFS='|' read -r user epoch; do
         [ -n "$user" ] || continue
         if [ "${epoch:-0}" -gt "${last[$user]:-0}" ]; then
             last[$user]="$epoch"
         fi
-    done < <(awk '{
+    done < <(awk '$1 !~ /^[0-9]/ { next }
+        {
             ts = int($1)
             for (i = 1; i <= NF; i++) {
                 if ($i == "for") {
@@ -769,20 +803,18 @@ build_samba_connection_cache_fast() {
         done < "$state"
     fi
 
-    local args=(SYSLOG_IDENTIFIER=smbd_audit --since "30 days ago" -o short-unix --no-pager)
     local tmp
     tmp=$(mktemp)
-    if ! journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null; then
-        rm -f "$cursor"
-        journalctl "${args[@]}" --cursor-file="$cursor" >"$tmp" 2>/dev/null || true
-    fi
+    journal_read_incremental "$cursor" "30 days ago" "$tmp" \
+        SYSLOG_IDENTIFIER=smbd_audit -o short-unix --no-pager
 
     while IFS='|' read -r user epoch; do
         [ -n "$user" ] || continue
         if [ "${epoch:-0}" -gt "${last[$user]:-0}" ]; then
             last[$user]="$epoch"
         fi
-    done < <(awk '{
+    done < <(awk '$1 !~ /^[0-9]/ { next }
+        {
             n = split($NF, f, "|")
             if (n < 4 || f[4] !~ /^(connect|write|pwrite|close)$/) next
             ts = int($1)
