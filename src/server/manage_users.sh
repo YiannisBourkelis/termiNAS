@@ -736,7 +736,7 @@ build_connection_cache_fast() {
     declare -A last=()
     local user epoch
 
-    if [ -s "$state" ]; then
+    if [ -f "$state" ]; then
         while IFS='|' read -r user epoch; do
             [ -n "$user" ] && last[$user]="$epoch"
         done < "$state"
@@ -753,9 +753,12 @@ build_connection_cache_fast() {
     local tmp
     tmp=$(mktemp)
     # SYSLOG_IDENTIFIER is a single indexed field; "-u ssh.service" expands to
-    # many match terms and costs several seconds on a large journal.
+    # many match terms and costs several seconds on a large journal. OpenSSH
+    # 9.8+ logs connections from a separate "sshd-session" process; repeating
+    # the field ORs the two identifiers.
     journal_read_incremental "$cursor" "90 days ago" "$tmp" \
-        SYSLOG_IDENTIFIER=sshd -o short-unix --no-pager --grep 'Accepted \S+ for '
+        SYSLOG_IDENTIFIER=sshd SYSLOG_IDENTIFIER=sshd-session \
+        -o short-unix --no-pager --grep 'Accepted \S+ for '
 
     while IFS='|' read -r user epoch; do
         [ -n "$user" ] || continue
@@ -825,7 +828,7 @@ build_samba_connection_cache_fast() {
     local state="$TERMINAS_CACHE_DIR/smb_activity"
     local cursor="$TERMINAS_CACHE_DIR/smb_activity.cursor"
     declare -A last=()
-    if [ -s "$state" ]; then
+    if [ -f "$state" ]; then
         while IFS='|' read -r user epoch; do
             [ -n "$user" ] && last[$user]="$epoch"
         done < "$state"
