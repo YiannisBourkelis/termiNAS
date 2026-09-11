@@ -2798,7 +2798,7 @@ info_user_fast() {
         local d name key entry logical_col files_col rfer_col excl_col
         for d in "$versions_dir"/*/; do
             [ -d "$d" ] || continue
-            name=$(basename "$d")
+            name="${d%/}"; name="${name##*/}"
             [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] || continue
             logical_col="n/a"; files_col="n/a"; rfer_col="n/a"; excl_col="n/a"
             if [ -s "$TERMINAS_CACHE_DIR/snapshots/$username/$name" ]; then

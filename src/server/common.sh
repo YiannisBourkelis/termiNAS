@@ -235,7 +235,7 @@ get_snapshot_range() {
     if [ -d "$versions_dir" ]; then
         for d in "$versions_dir"/*/; do
             [ -d "$d" ] || continue
-            name=$(basename "$d")
+            name="${d%/}"; name="${name##*/}"
             [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] || continue
             count=$((count + 1))
             [ -z "$oldest" ] && oldest="$name"
@@ -327,7 +327,7 @@ get_snapshot_set() {
     local d name names=""
     for d in "/home/$user/versions"/*/; do
         [ -d "$d" ] || continue
-        name=$(basename "$d")
+        name="${d%/}"; name="${name##*/}"
         [[ "$name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}$ ]] || continue
         names="${names:+$names,}$name"
     done
@@ -417,7 +417,7 @@ refresh_snapshot_size_cache() {
     local f
     for f in "$snapdir"/*; do
         [ -f "$f" ] || continue
-        name=$(basename "$f")
+        name="${f##*/}"
         case ",$snapset," in
             *",$name,"*) ;;
             *) rm -f "$f" ;;
