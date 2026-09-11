@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`manage_users.sh list-fast` and `info-fast`** (experimental): compute all sizes from a single `btrfs qgroup show` call instead of walking every file, so they complete in well under a second regardless of file count. Provided alongside `list`/`info` for side-by-side comparison; `info-fast` includes a per-snapshot Referenced/Exclusive breakdown.
 - Shared helpers in `common.sh`: `build_qgroup_usage_cache` (one-pass qgroup parser keyed by user), `bytes_to_mb`, `get_snapshot_range`, `snapshot_name_to_epoch`.
+- Single-pass connection caches used by the `-fast` commands: SSH logins via one `journalctl -o short-unix --grep` query (no per-timestamp `date` subprocesses), Samba activity via one scan for all users instead of one journal scan per Samba user.
+
+### Fixed
+- Samba last-connection detection (in the `-fast` caches) no longer counts `disconnect` events as activity; the substring match for `connect` in the original implementation does.
 
 ### Notes
 - The alpha.4 changelog entry stating that `list` was switched to a single qgroup fetch was inaccurate: `list` still runs `btrfs filesystem du` per user. The `-fast` variants deliver that change.

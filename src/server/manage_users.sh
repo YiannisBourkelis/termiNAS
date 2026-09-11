@@ -660,6 +660,85 @@ build_connection_cache() {
     fi
 }
 
+# Fast SSH connection cache: single journal query with native timestamps and
+# native filtering, so no per-timestamp `date` subprocesses and no year-rollover
+# guessing. Falls back to the original implementation when journald is absent.
+build_connection_cache_fast() {
+    declare -gA CONNECTION_CACHE=()
+
+    if ! command -v journalctl &>/dev/null; then
+        build_connection_cache
+        return
+    fi
+
+    local user epoch formatted
+    while IFS='|' read -r user epoch; do
+        [ -n "$user" ] && [ "${epoch:-0}" -gt 0 ] || continue
+        formatted=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+        CONNECTION_CACHE[$user]="$formatted|$epoch"
+    done < <(journalctl -u ssh.service -u sshd.service --since "90 days ago" -o short-unix --no-pager \
+                --grep 'Accepted (password|publickey) for' 2>/dev/null | \
+        awk '{
+            ts = int($1)
+            for (i = 1; i <= NF; i++) {
+                if ($i == "for") {
+                    u = $(i + 1)
+                    if (!(u in last) || ts > last[u]) last[u] = ts
+                    break
+                }
+            }
+        }
+        END { for (u in last) print u "|" last[u] }')
+}
+
+# Fast Samba connection cache: ONE pass over the audit source for all users
+# (the original scans the journal once per Samba-enabled user).
+# Audit payload format: user|ip|machine|operation|... (last field of the line)
+build_samba_connection_cache_fast() {
+    declare -gA SAMBA_CONNECTION_CACHE=()
+
+    local audit_log="/var/log/samba/audit.log"
+    local current_epoch
+    current_epoch=$(date +%s)
+
+    local user epoch formatted
+    if [ -s "$audit_log" ]; then
+        # Syslog-style lines without a year: "Mon DD HH:MM:SS host ... user|ip|machine|op"
+        while IFS='|' read -r user epoch; do
+            [ -n "$user" ] && [ "${epoch:-0}" -gt 0 ] || continue
+            formatted=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+            SAMBA_CONNECTION_CACHE[$user]="$formatted|$epoch"
+        done < <(awk -v current_epoch="$current_epoch" '
+            /^[A-Za-z]/ {
+                n = split($NF, f, "|")
+                if (n < 4 || f[4] !~ /^(connect|write|pwrite|close)$/) next
+                ts = $1 " " $2 " " $3
+                if (!(ts in cache)) {
+                    cmd = "date -d \"" ts "\" +%s 2>/dev/null"
+                    cmd | getline e; close(cmd)
+                    if (e > current_epoch) e -= 31536000
+                    cache[ts] = e
+                }
+                e = cache[ts]
+                if (!(f[1] in last) || e > last[f[1]]) last[f[1]] = e
+            }
+            END { for (u in last) print u "|" last[u] }' "$audit_log")
+    elif command -v journalctl &>/dev/null; then
+        while IFS='|' read -r user epoch; do
+            [ -n "$user" ] && [ "${epoch:-0}" -gt 0 ] || continue
+            formatted=$(date -d "@$epoch" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+            SAMBA_CONNECTION_CACHE[$user]="$formatted|$epoch"
+        done < <(journalctl --since "30 days ago" SYSLOG_IDENTIFIER=smbd_audit -o short-unix --no-pager 2>/dev/null | \
+            awk '{
+                n = split($NF, f, "|")
+                if (n < 4 || f[4] !~ /^(connect|write|pwrite|close)$/) next
+                ts = int($1)
+                if (!(f[1] in last) || ts > last[f[1]]) last[f[1]] = ts
+            }
+            END { for (u in last) print u "|" last[u] }')
+    fi
+}
+
 # Get last connection time for a user from cache
 get_last_connection() {
     local user="$1"
@@ -2296,9 +2375,11 @@ print_retention_policy() {
 print_qgroup_inconsistency_note() {
     if [ "${QGROUP_INCONSISTENT:-false}" = true ]; then
         echo ""
-        echo -e "\033[1;33m⚠ Btrfs reports quota accounting as inconsistent; figures may be stale.\033[0m"
-        echo "  Refresh (this drops all qgroup limits - reapply quotas with set-quota afterwards):"
-        echo "    btrfs quota disable /home && btrfs quota enable --simple /home"
+        echo -e "\033[1;33m⚠ Btrfs reports quota accounting as inconsistent.\033[0m"
+        echo "  With simple quotas this is expected when data existed before quotas were enabled:"
+        echo "  such extents are never attributed, so Size/Apparent below only cover data written"
+        echo "  after enablement. Do NOT toggle quotas off/on to fix it - that resets attribution"
+        echo "  for ALL current data. Use 'list' / 'info' for exact figures of existing data."
     fi
     return 0
 }
@@ -2338,9 +2419,9 @@ list_users_fast() {
         echo "--------------------------------------------------------------------------------------------------------------------------------------"
     fi
 
-    build_connection_cache
+    build_connection_cache_fast
     if [ "$any_samba" = true ]; then
-        build_samba_connection_cache
+        build_samba_connection_cache_fast
     fi
 
     local total_actual_bytes=0 total_apparent_bytes=0 total_users=0
@@ -2475,8 +2556,10 @@ info_user_fast() {
     echo "Home: $home_dir"
     echo ""
 
-    build_connection_cache
-    build_samba_connection_cache
+    build_connection_cache_fast
+    if has_samba_enabled "$username"; then
+        build_samba_connection_cache_fast
+    fi
     print_connection_activity "$username"
     echo ""
 

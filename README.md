@@ -578,9 +578,10 @@ Differences to be aware of:
   as attributed by simple quotas). **Apparent** is the sum of *Referenced* bytes (each
   subvolume counted as an independent copy).
 - Data written before quotas were enabled is not attributed to any qgroup and is not counted.
-- If Btrfs reports its accounting as inconsistent, a warning is printed. Refresh with
-  `btrfs quota disable /home && btrfs quota enable --simple /home`, then reapply every
-  user's quota with `set-quota` (disabling quotas drops all qgroup limits).
+- If Btrfs reports its accounting as inconsistent, a warning is printed. With simple
+  quotas this is expected whenever data existed before quotas were enabled: those extents
+  are never attributed and there is no rescan that can back-fill them. **Do not toggle
+  quotas off and on to "refresh"** — that resets attribution for all current data.
 - `info-fast` skips the upload file count, since counting requires a full tree walk.
 
 #### macOS Time Machine Support
