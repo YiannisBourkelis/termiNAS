@@ -19,7 +19,26 @@ set -e
 TEST_USER="terminas_test_quota"
 TEST_QUOTA_GB=1  # 1GB quota for testing
 TEST_FILE_SIZE_MB=300  # Create 300MB files
-MONITOR_WAIT_TIME=70  # Wait time for monitor to create snapshot (debounce + buffer)
+MONITOR_WAIT_TIME=${MONITOR_WAIT_TIME:-150}  # Max wait for the monitor to create a snapshot
+
+# Wait until a new snapshot appears, polling every 5s up to MONITOR_WAIT_TIME.
+# With generation polling a snapshot follows the last write by the inactivity
+# window (60s) plus up to one Btrfs commit interval (30s) and one poll (10s).
+# Usage: wait_for_snapshot <snapshot_count_before>   (0 = new snapshot exists)
+wait_for_snapshot() {
+    local before="$1"
+    local waited=0 now_count
+    while [ "$waited" -lt "$MONITOR_WAIT_TIME" ]; do
+        sleep 5
+        waited=$((waited + 5))
+        now_count=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+        if [ "$now_count" -gt "$before" ]; then
+            echo "  (snapshot appeared after ${waited}s)"
+            return 0
+        fi
+    done
+    return 1
+}
 TEST_FILES_DIR="/var/tmp/terminas_test"  # Use /var/tmp instead of /tmp (more space)
 
 # Color codes for output
@@ -142,7 +161,7 @@ echo "Test Configuration:"
 echo "  Test user: $TEST_USER"
 echo "  Quota limit: ${TEST_QUOTA_GB}GB"
 echo "  Test file size: ${TEST_FILE_SIZE_MB}MB each"
-echo "  Monitor wait time: ${MONITOR_WAIT_TIME}s"
+echo "  Monitor wait time: up to ${MONITOR_WAIT_TIME}s (polls every 5s)"
 echo "  Test files directory: $TEST_FILES_DIR"
 echo ""
 
@@ -309,12 +328,12 @@ else
     exit 1
 fi
 
-echo "Waiting ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
+echo "Waiting up to ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
 
 # Get snapshot count before
 snapshot_count_before=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 
-sleep "$MONITOR_WAIT_TIME"
+wait_for_snapshot "$snapshot_count_before" || true
 
 # Get snapshot count after
 snapshot_count_after=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
@@ -357,12 +376,12 @@ else
     "$SCRIPT_DIR/manage_users.sh" show-quota "$TEST_USER"
 fi
 
-echo "Waiting ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
+echo "Waiting up to ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
 
 # Get snapshot count before
 snapshot_count_before=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 
-sleep "$MONITOR_WAIT_TIME"
+wait_for_snapshot "$snapshot_count_before" || true
 
 # Get snapshot count after
 snapshot_count_after=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
@@ -427,8 +446,8 @@ else
 fi
 
 if [ -z "$QUOTA_BLOCKED_AT" ]; then
-    echo "Waiting ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
-    sleep "$MONITOR_WAIT_TIME"
+    echo "Waiting up to ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
+    wait_for_snapshot "$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)" || true
 fi
 
 # Rescan quota to ensure accurate accounting
@@ -467,8 +486,8 @@ if [ -z "$QUOTA_BLOCKED_AT" ]; then
         # Get snapshot count before attempting snapshot of over-quota state
         snapshot_count_before=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
         
-        echo "Waiting ${MONITOR_WAIT_TIME}s for monitor to attempt snapshot..."
-        sleep "$MONITOR_WAIT_TIME"
+        echo "Waiting up to ${MONITOR_WAIT_TIME}s for monitor to attempt snapshot..."
+        wait_for_snapshot "$snapshot_count_before" || true
         
         # Get snapshot count after
         snapshot_count_after=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
@@ -538,8 +557,8 @@ chown "$TEST_USER:backupusers" "/home/$TEST_USER/uploads/test_file_5.dat"
 # Get snapshot count before
 snapshot_count_before=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
 
-echo "Waiting ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
-sleep "$MONITOR_WAIT_TIME"
+echo "Waiting up to ${MONITOR_WAIT_TIME}s for monitor to create snapshot..."
+wait_for_snapshot "$snapshot_count_before" || true
 
 # Get snapshot count after
 snapshot_count_after=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)

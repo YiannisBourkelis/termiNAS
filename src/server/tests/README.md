@@ -158,7 +158,7 @@ sudo ./test_quota.sh --cleanup-only
 - Test user: `terminas_test_quota`
 - Quota limit: 1GB (expandable during tests)
 - Test file size: 300MB each
-- Monitor wait time: 70s (for snapshot creation)
+- Monitor wait time: up to 150s, polling every 5s (snapshot follows the last write by the 60s inactivity window plus up to one Btrfs commit interval and one poll)
 
 **What it tests:**
 1. Btrfs quotas are enabled on `/home`

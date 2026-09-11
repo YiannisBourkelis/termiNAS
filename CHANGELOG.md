@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`manage_users.sh status [--quiet]`**: one-command health check with Nagios-style exit codes (0/1/2) covering the monitor service and its poll heartbeat, changes not snapshotted within the maximum interval, quota-blocked users, `/home` usage, nightly cron jobs, SSH/fail2ban/Samba, and Btrfs housekeeping. The monitor now writes a heartbeat and per-user pending markers under `/var/run/terminas/` for it.
 
 ### Fixed
+- Test scripts wait for a snapshot to appear (polling up to 150s) instead of sleeping a fixed 70s, which the generation-polling monitor's commit+poll latency could exceed.
 - Samba last-connection detection no longer counts `disconnect` events as activity.
 - `delete_user.sh` removes the deleted user's size cache.
 

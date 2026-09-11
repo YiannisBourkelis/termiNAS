@@ -52,7 +52,7 @@ SCRIPT_DIR="$(cd "$TEST_DIR/.." && pwd)"
 TEST_USER="terminas_test_cleanup"
 TEST_FILE_DIR="/var/tmp/terminas_test_cleanup"
 TEST_FILE="$TEST_FILE_DIR/file_20mb.dat"
-WAIT_SECS=${WAIT_SECS:-70}   # wait for snapshot (monitor debounce + buffer)
+WAIT_SECS=${WAIT_SECS:-150}  # max wait for snapshot (inactivity window + Btrfs commit + poll)
 
 log() { echo -e "${BLUE}==>${NC} $*"; }
 pass() { echo -e "${GREEN}✓${NC} $*"; }
@@ -109,8 +109,13 @@ create_user_and_snapshot() {
   log "Waiting up to ${WAIT_SECS}s for snapshot creation"
   local before after
   before=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || echo 0)
-  sleep "$WAIT_SECS"
-  after=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || echo 0)
+  local waited=0
+  after=$before
+  while [ "$waited" -lt "$WAIT_SECS" ] && [ "$after" -le "$before" ]; do
+    sleep 5
+    waited=$((waited + 5))
+    after=$(find "/home/$TEST_USER/versions" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l || echo 0)
+  done
   if [ "$after" -gt "$before" ]; then
     pass "Snapshot created (${after} total)"
   else
