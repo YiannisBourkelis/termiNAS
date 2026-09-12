@@ -6,7 +6,8 @@ This document explains how per-user storage quotas are configured, enabled, modi
 
 - **Setup (`setup.sh`)**
   - Enables Btrfs simple quotas on `/home` (`btrfs quota enable --simple /home`).
-  - Generates `/var/terminas/scripts/terminas-monitor.sh` (real-time monitor) and `/var/terminas/scripts/terminas-cleanup.sh` (retention + recheck) with built-in quota helpers.
+  - Generates `/var/terminas/scripts/terminas-monitor.sh` (snapshot monitor) and `/var/terminas/scripts/terminas-cleanup.sh` (retention + recheck), and installs `/var/terminas/scripts/common.sh` (quota parsing and the one-pass qgroup reader) which both source.
+  - Warns if `/home` is in full qgroup mode rather than simple quotas (see "Quota modes" below).
   - Installs `terminas-monitor.service` to run the monitor.
   - Leaves the default quota for new users at `DEFAULT_QUOTA_GB` (0 = unlimited) in `/etc/terminas-retention.conf`.
 
@@ -54,10 +55,9 @@ This document explains how per-user storage quotas are configured, enabled, modi
 ## Monitoring and Services
 
 - **terminas-monitor.sh** (systemd service `terminas-monitor.service`)
-  - Watches `/home` for `close_write` and `delete` under `uploads/`.
-  - Debounces activity and creates Btrfs snapshots under `/home/<user>/versions/<timestamp>`.
-  - Runs hybrid quota check after each snapshot; blocks/unblocks uploads by adjusting qgroup limits and setting/clearing `.terminas-quota-exceeded`.
-  - On delete events, if the user is blocked, it rechecks total usage to auto-unblock when under limit.
+  - Polls Btrfs generation numbers and creates snapshots under `/home/<user>/versions/<timestamp>` (see `SNAPSHOT_MONITOR_ARCHITECTURE.md`).
+  - Runs the hybrid quota check after each snapshot using one `btrfs qgroup show` call for all subvolumes; blocks/unblocks uploads by adjusting the uploads qgroup limit and setting/clearing `.terminas-quota-exceeded`.
+  - If a blocked user's uploads generation changes (typically deletions), it rechecks total usage on the next poll and auto-unblocks when under the limit.
 
 - **terminas-cleanup.sh** (cron, daily)
   - Applies retention (GFS or age-based) and removes old snapshots.
@@ -69,8 +69,15 @@ This document explains how per-user storage quotas are configured, enabled, modi
 2. If total usage (uploads + snapshots) exceeds limit after a snapshot:
    - Monitor sets uploads qgroup limit to 1 byte (blocks uploads) and writes `.terminas-quota-exceeded`.
    - User must delete files from `uploads/` or wait for retention cleanup to free space.
-3. When space is freed (delete event or cleanup recheck):
+3. When space is freed (the blocked user's data changes, or the cleanup recheck):
    - Monitor/cleanup recalculates totals; if under limit, restores the configured qgroup limit and removes the flag.
+
+## Quota Modes and Reporting
+
+- termiNAS requires **simple quotas** (`btrfs quota enable --simple`). Full qgroup accounting resolves back-references on every snapshot creation and deletion, which can stall writes; its "exclusive" figure also excludes data shared with snapshots, so the hybrid total undercounts, and the kernel stops accounting new data while the filesystem is flagged inconsistent until `btrfs quota rescan` completes.
+- Check the mode with `cat /sys/fs/btrfs/<uuid>/qgroups/mode` (`squota` or `qgroup`); `manage_users.sh status` and `setup.sh` report it. `manage_users.sh migrate-squota` converts a filesystem from full mode and re-applies every configured limit.
+- Simple quotas attribute an extent to the subvolume that first wrote it and never look back: data that existed before they were enabled is never counted, `btrfs quota rescan` does not apply, and Btrfs reports the accounting as "inconsistent" for as long as such data exists. This is expected. **Never disable and re-enable quotas to "refresh"** — that resets attribution for all current data.
+- Consequently quota accounting is used for *enforcement* only. Size reporting in `manage_users.sh list`/`info` comes from `refresh-sizes` (`btrfs filesystem du` and a file walk, cached in `/var/terminas/cache/`), not from qgroups.
 
 ## Quick Reference Commands
 

@@ -301,7 +301,7 @@ Tested with:
 
 - [RCLONE_BACKUP_SETUP.md](../src/client/windows/RCLONE_BACKUP_SETUP.md) - Windows client setup
 - [QUOTA_ARCHITECTURE.md](QUOTA_ARCHITECTURE.md) - Server-side quota enforcement
-- [ARCHITECTURE_PER_USER_INOTIFY.md](ARCHITECTURE_PER_USER_INOTIFY.md) - Server-side snapshot monitoring
+- [SNAPSHOT_MONITOR_ARCHITECTURE.md](SNAPSHOT_MONITOR_ARCHITECTURE.md) - Server-side snapshot monitoring
 
 ## Reference Documentation
 

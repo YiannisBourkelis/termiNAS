@@ -99,16 +99,16 @@ asynchronously. The `btrfs subvolume list -d` command may show "DELETED" entries
 
 **Why Pending Deletions Occur:**
 
-The `terminas-monitor.sh` service uses `inotifywait -m -r /home` which creates inotify 
-watches on all directories under `/home`. These watches hold **kernel-level references** 
-to inodes. When a user's directories are deleted, the inotify watches remain active until 
-the inotifywait process is restarted, preventing immediate space reclamation.
+`btrfs subvolume delete` only marks a subvolume for deletion; the kernel's cleaner thread
+frees its extents afterwards, in the background. The entries disappear on their own within
+seconds to minutes depending on size. (The former inotify-based monitor held references to
+deleted inodes and could delay this until a service restart; the generation-polling monitor
+does not.)
 
 **Key Points:**
-- Pending deletions continue to consume space until cleanup completes
-- Space is reclaimed when `terminas-monitor.service` restarts (e.g., reboot)
+- Pending deletions consume space only until the Btrfs cleaner processes them
 - No data integrity issues result from pending deletions
-- This is standard Linux/Btrfs behavior, not a termiNAS bug
+- This is standard Btrfs behavior, not a termiNAS bug
 
 **What This Test Verifies:**
 1. User deletion completes successfully
@@ -121,13 +121,10 @@ the inotifywait process is restarted, preventing immediate space reclamation.
 - List of subvolumes for the test user
 - Pending deletions count at each step
 - ✓ PASS: Subvolumes properly marked for deletion
-- Note: Pending deletions are explained as normal inotify behavior
-
-**Alternative Architecture:**
-
-For immediate space reclamation, a per-user inotify architecture could be implemented 
-where each user has their own inotifywait process. See `docs/ARCHITECTURE_PER_USER_INOTIFY.md` 
-for details. This is not currently implemented as pending deletions are harmless.
+- Note: Deleted subvolumes are reclaimed asynchronously by the Btrfs cleaner and may
+  show as pending briefly. The generation-polling monitor holds no references to deleted
+  inodes, so reclamation no longer waits for a service restart (see
+  `docs/SNAPSHOT_MONITOR_ARCHITECTURE.md`).
 
 **Notes:**
 - Test automatically cleans up test user

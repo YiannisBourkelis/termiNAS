@@ -113,9 +113,9 @@ mount /dev/sdXY /home
 ```
 
 ### Client Requirements
-- Linux/Unix system (for Linux client) or Windows (for PowerShell client)
-- Git (for cloning repository and updates)
-- lftp or sshpass (installed automatically if needed)
+- Linux/Unix system or Windows
+- rclone (installed automatically by `setup-client.sh` on Linux; downloaded manually on Windows)
+- Git (for cloning the repository on Linux)
 - Basic knowledge of SFTP
 
 ## Installation
@@ -258,7 +258,7 @@ Installing Backup Configuration
 ✓ Created backup script: /usr/local/bin/terminas-backup/backup-web1-production.sh
 ✓ Created log rotation config: /etc/logrotate.d/terminas-web1-production
 ✓ Added cron job to run daily at 01:00
-✓ lftp is installed
+✓ rclone is installed
 
 ==========================================
 Setup Complete!
@@ -1096,29 +1096,28 @@ sudo ./manage_users.sh restore username 2025-10-14_12-47-05 /tmp/restore
 The monitor detects changes by polling Btrfs generation numbers (one `btrfs subvolume list` call for all users every 10 seconds; detection latency is that interval plus the Btrfs commit interval, 30 s by default). A generation change alone is not enough: `btrfs subvolume find-new` must also report new data extents, so directory listings (atime), permission changes or pure deletions never produce empty snapshots. Mounting `/home` with `noatime` (recommended anyway) avoids the metadata churn entirely. The monitor uses **smart periodic snapshots** that exclude in-progress files:
 
 **How it works:**
-1. **Immediate snapshot when all files complete**: No waiting - snapshot taken 60s after last file closes
-2. **Periodic snapshots while uploading**: Takes snapshot every 30 minutes (default) if files are still open
-3. **Excludes in-progress files**: Only completed (closed) files are included in periodic snapshots
-4. **Efficient snapshot management**: Prevents excessive snapshot creation from frequent small file changes
+1. **One snapshot per upload batch**: the snapshot is taken once the user's data has been quiet for the inactivity window (60s). Because generations only move on Btrfs transaction commits, expect it 70–100s after the last write.
+2. **Periodic snapshots during long uploads**: if activity never pauses, a snapshot is forced every 30 minutes (default); files that some process still holds open for writing are left out of it.
+3. **Final snapshot includes everything**: when the upload finishes and activity stops, the next snapshot captures the completed files.
+4. **No empty snapshots**: metadata-only changes (directory listings, permission changes, pure deletions) never trigger a snapshot.
 
 **Example scenarios:**
 
 **Scenario 1: Quick upload (all files complete quickly)**
 ```
 03:00:00 - Start uploading: file1.sql (10 MB) + file2.sql (50 MB)
-03:00:15 - Both files complete (all closed)
-03:01:15 - Immediate snapshot: includes BOTH files (60-second wait completed!)
+03:00:15 - Both files complete
+03:01:30 - Snapshot: includes BOTH files (60s quiet + commit/poll latency)
 ```
 
 **Scenario 2: Mixed upload (small + large files)**
 ```
 03:00:00 - Start uploading: small.sql (10 MB) + huge.tar.gz (500 GB)
-03:00:30 - small.sql completes (closed)
-03:00:30 - huge.tar.gz still uploading (in progress...)
-03:30:30 - Periodic snapshot #1: includes small.sql, EXCLUDES huge.tar.gz (still open)
-04:00:30 - Periodic snapshot #2: includes small.sql, EXCLUDES huge.tar.gz (still open)
-04:15:00 - huge.tar.gz completes (all files closed)
-04:15:30 - Final snapshot: includes BOTH small.sql + huge.tar.gz (immediate!)
+03:00:30 - small.sql completes; huge.tar.gz still uploading (activity never pauses)
+03:30:30 - Periodic snapshot #1: includes small.sql, EXCLUDES huge.tar.gz (still open for writing)
+04:00:30 - Periodic snapshot #2: same
+04:15:00 - huge.tar.gz completes
+04:16:30 - Final snapshot: includes BOTH small.sql + huge.tar.gz
 ```
 
 **Configuration** (edit `/etc/systemd/system/terminas-monitor.service`):
@@ -1136,10 +1135,11 @@ Environment="TERMINAS_SNAPSHOT_INTERVAL=1800"  # Max wait time: force snapshot a
 
 | Scenario | Snapshot Timing | Notes |
 |----------|----------------|-------|
-| **Single file upload** | 60 seconds after upload completes | One snapshot per batch |
-| **Multiple files (batch)** | 60 seconds after LAST file completes | One snapshot for entire batch! |
-| **Files still uploading** | Every 30 minutes (default) | Periodic snapshots exclude in-progress files |
-| **Large ongoing upload** | 60 seconds after large file finishes | Final snapshot includes everything |
+| **Single file upload** | ~70–100 s after upload completes | One snapshot per batch |
+| **Multiple files (batch)** | ~70–100 s after LAST file completes | One snapshot for entire batch |
+| **Files still uploading** | Every 30 minutes (default) | Periodic snapshots exclude files open for writing |
+| **Large ongoing upload** | ~70–100 s after the large file finishes | Final snapshot includes everything |
+| **Directory listing / no data written** | never | Metadata-only changes are ignored |
 
 **Recommended intervals:**
 
@@ -1314,6 +1314,8 @@ To modify or extend the scripts:
 - `src/client/linux/setup-client.sh` - Linux client backup setup (creates rclone config)
 - `/var/terminas/scripts/terminas-monitor.sh` - Real-time snapshot monitor, Btrfs generation polling (created by setup)
 - `/var/terminas/scripts/terminas-cleanup.sh` - Retention policy cleanup (created by setup)
+- `/var/terminas/scripts/common.sh` - Shared helpers used by the generated scripts (copied from `src/server/common.sh` by setup)
+- `/var/terminas/cache/` - Size cache written by `manage_users.sh refresh-sizes` (read by `list`/`info`)
 - `/etc/terminas-retention.conf` - Retention configuration (created by setup)
 
 ## Troubleshooting
@@ -1333,15 +1335,13 @@ Get-ScheduledTask -TaskName "termiNAS-Backup-<jobname>" | Get-ScheduledTaskInfo
 
 ### Linux Client Issues
 
-**Problem: "lftp: command not found" or "sftp: command not found"**
+**Problem: "rclone: command not found"**
 
-Solution:
+`setup-client.sh` installs rclone through the system package manager; if that failed or you set up the job by hand:
 ```bash
-# Install lftp (recommended)
-sudo apt-get install lftp
-
-# Or install openssh-client for sftp
-sudo apt-get install openssh-client
+sudo apt-get install rclone            # Debian/Ubuntu
+# or the upstream installer for the latest version:
+curl https://rclone.org/install.sh | sudo bash
 ```
 
 **Problem: "Host key verification failed"**
@@ -1376,62 +1376,30 @@ ignoreip = 127.0.0.1/8 ::1 192.168.1.0/24 10.0.0.0/8
 
 **Note: Pending Btrfs deletions after snapshot removal**
 
-- Deleted subvolumes are reclaimed asynchronously by the Btrfs cleaner and may show as pending for a short while. The former inotify monitor could delay this indefinitely; the current generation-polling monitor does not (see [docs/ARCHITECTURE_PER_USER_INOTIFY.md](docs/ARCHITECTURE_PER_USER_INOTIFY.md) for the history). `sudo ./src/server/manage_users.sh force-clean` restarts the monitor and syncs the filesystem if you want to check reclamation immediately.
+- Deleted subvolumes are reclaimed asynchronously by the Btrfs cleaner and may show as pending for a short while. The former inotify monitor could delay this indefinitely; the current generation-polling monitor does not (see [docs/SNAPSHOT_MONITOR_ARCHITECTURE.md](docs/SNAPSHOT_MONITOR_ARCHITECTURE.md)). `sudo ./src/server/manage_users.sh force-clean` restarts the monitor and syncs the filesystem if you want to check reclamation immediately.
 
 **Problem: Snapshots missing files or contain incomplete files**
 
-**This is now fixed!** The new monitor logic creates **periodic snapshots** (every 30 minutes) that automatically exclude in-progress files.
-
-**How it works:**
-- Small completed files are included in snapshots within 30 minutes
-- Large files still uploading are excluded from periodic snapshots
-- Final snapshot is created when ALL files complete
-
-Update your installation:
-```bash
-# Pull latest fix
-cd /opt/terminas
-git pull
-
-# Re-run setup to update monitor script
-sudo ./src/server/setup.sh
-
-# Restart service
-sudo systemctl restart terminas-monitor.service
-
-# Verify new logic is applied
-sudo grep "Excluding in-progress" /var/terminas/scripts/terminas-monitor.sh
-```
+The monitor never includes a file that some process still holds open for writing: such files are removed from periodic snapshots taken during a long upload, and captured by the final snapshot once the upload completes and activity stops. A file that looks "missing" from a snapshot was still being uploaded when that snapshot was taken.
 
 **Monitor the snapshot process:**
-
 ```bash
-# Watch for open files in uploads directory
-sudo watch -n 1 "lsof +D /home/*/uploads 2>/dev/null | grep -E '\s+[0-9]+[uw]'"
+# Health summary (monitor alive, users with uncaptured changes, last snapshot)
+sudo ./src/server/manage_users.sh status
 
-# Check monitor logs to see exclusions
-sudo tail -f /var/log/backup_monitor.log
+# Follow the monitor log
+sudo tail -f /var/log/terminas.log
 
 # Example log output (10 MB + 500 GB mixed upload):
-# 2025-10-09 03:00:30 Activity for eventsaxd: waiting for interval or completion
-# 2025-10-09 03:30:30 Excluding in-progress files from snapshot:
-# 2025-10-09 03:30:30   Excluded: huge.tar.gz (387GB, still uploading)
-# 2025-10-09 04:00:30 Excluding in-progress files from snapshot:
-# 2025-10-09 04:00:30   Excluded: huge.tar.gz (465GB, still uploading)
-# 2025-10-09 04:15:00 huge.tar.gz upload completes
-# 2025-10-09 04:16:00 Btrfs snapshot created for eventsaxd (all files closed)
+# 2026-09-11 03:30:30   Excluded: huge.tar.gz (still open for writing)
+# 2026-09-11 03:30:30 Btrfs snapshot created for eventsaxd at 2026-09-11_03-30-30 (periodic snapshot after 1810s of continuous activity, excluded 1 in-progress files)
+# 2026-09-11 04:16:30 Btrfs snapshot created for eventsaxd at 2026-09-11_04-16-30 (upload complete (no activity for 61s))
 
-# Example log output (quick upload - all files complete fast):
-# 2025-10-09 05:00:10 files.tar.gz upload completes
-# 2025-10-09 05:01:10 Btrfs snapshot created for eventsaxd (all files closed)
-# ↑ Immediate snapshot (no 30-minute wait!)
-```
+# Files currently open for writing under a user's uploads (what the monitor sees)
+sudo find /proc/[0-9]*/fd -maxdepth 1 -lname '/home/<user>/uploads/*' -printf '%l\n' 2>/dev/null | sort -u
 
-**Verify excluded files:**
-```bash
-# Check final snapshot (all files present)
-ls -lh /home/user/versions/2025-10-09_04-16-00/
-# Shows: small.sql (10 MB), huge.tar.gz (500 GB)
+# Verify the installed monitor is the generation-polling version
+grep -c 'generation polling' /var/terminas/scripts/terminas-monitor.sh   # 1 = current; 0 = re-run setup.sh
 ```
 
 **View snapshot history:**
@@ -1440,19 +1408,19 @@ ls -lh /home/user/versions/2025-10-09_04-16-00/
 ls -lht /home/eventsaxd/versions/
 
 # Compare snapshots (see what changed)
-diff -r /home/eventsaxd/versions/2025-10-09_03-00-08 \
-        /home/eventsaxd/versions/2025-10-09_04-30-15
+diff -r /home/eventsaxd/versions/2026-09-11_03-30-30 \
+        /home/eventsaxd/versions/2026-09-11_04-16-30
 ```
 
 ### For very large files (500+ GB):
 
-The monitor automatically handles files of any size by waiting until they're fully closed. However, if uploads take longer than 10 minutes (default `TERMINAS_MAX_WAIT=600`), increase the timeout:
+Nothing needs to change: an upload of any length is captured by the final snapshot after it completes. If you prefer fewer intermediate snapshots during multi-hour uploads, raise `TERMINAS_SNAPSHOT_INTERVAL` (see Snapshot Timing Configuration):
 
 ```bash
 sudo nano /etc/systemd/system/terminas-monitor.service
 
 # Add to [Service] section:
-Environment="TERMINAS_MAX_WAIT=1800"  # 30 minutes for very slow uploads
+Environment="TERMINAS_SNAPSHOT_INTERVAL=7200"  # periodic snapshot every 2 hours during continuous activity
 
 sudo systemctl daemon-reload
 sudo systemctl restart terminas-monitor.service
@@ -1460,7 +1428,7 @@ sudo systemctl restart terminas-monitor.service
 
 **Best practices:**
 1. Upload during off-peak hours (less I/O contention)
-2. Monitor logs to verify snapshots capture complete files
+2. Check `manage_users.sh status` after large uploads: it flags users whose changes have not been snapshotted within the maximum interval
 3. Use fast network (10 Gbps) for massive file uploads
 4. Consider dedicated backup disk/network for better throughput
 

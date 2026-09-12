@@ -24,7 +24,7 @@ This project aims to create a secure, versioned backup server on Debian Linux. K
    - Installs and configures necessary software on a Debian system (e.g., OpenSSH with internal-sftp for restricted access).
    - Sets up SSH/SFTP with security best practices (e.g., no root login, chrooted SFTP).
    - Creates a group for backup users.
-   - Configures real-time versioning via inotify watchers that trigger snapshots on filesystem changes.
+   - Configures real-time versioning: a monitor service detects changes to each user's uploads (by polling Btrfs generation numbers) and creates read-only Btrfs snapshots.
    - Prepares the server environment for user creation.
 
 2. **User Creation Script (`create_user.sh <username>`)**:
@@ -38,12 +38,12 @@ This project aims to create a secure, versioned backup server on Debian Linux. K
 - **Ransomware Mitigation**: Versioned snapshots are owned by root and not modifiable by users, preventing malware from altering or deleting historical versions.
 - **Access Control**: Users are chrooted to their home directories with SFTP-only access; no shell or SCP access.
 - **Authentication**: Uses SSH keys or passwords (with strong defaults); can be configured for key-only later.
-- **Data Integrity**: Snapshots utilize Btrfs Copy-on-Write (CoW) technology with rsync hardlinks, leveraging Btrfs deduplication to store only block-level changes while maintaining full version history with minimal disk space usage.
+- **Data Integrity**: Snapshots are read-only Btrfs subvolumes; copy-on-write means unchanged blocks are shared between versions, so full version history costs only the changed data.
 
 ### Assumptions and Scope
 - Target OS: Debian Linux (tested on recent versions).
 - No advanced features like encryption at rest, web UI, or cloud integration (can be added later).
-- Versioning is real-time (triggered by filesystem changes using inotify); snapshots created immediately on file additions, removals, or modifications.
+- Versioning is near-real-time: a snapshot follows the end of an upload by about a minute (the monitor waits for activity to stop, then snapshots once), with periodic snapshots during very long uploads.
 - Scripts require root/sudo access for installation and user management.
 - Clients use standard tools like SFTP clients (e.g., FileZilla, WinSCP) or `sftp` command for uploads/downloads.
 
